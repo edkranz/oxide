@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "A fast, lightweight text editor"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 arboard = "3"

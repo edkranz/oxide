@@ -77,3 +77,7 @@ frame to an image.
 
 Known limits today: one selection; caret moves by code point rather than grapheme
 cluster; lines over 16 KB aren't highlighted; no word wrap.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
