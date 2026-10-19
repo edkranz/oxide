@@ -175,11 +175,56 @@ pub struct Metrics {
 }
 
 /// Shaped lines for one window, reused across frames until they go off screen.
+/// A laid-out line of text: one row, or several when wrapped. Derefs to the first row.
+#[derive(Clone)]
+pub struct Laid(Rc<Vec<LayoutLine>>);
+
+impl std::ops::Deref for Laid {
+    type Target = LayoutLine;
+    fn deref(&self) -> &LayoutLine {
+        &self.0[0]
+    }
+}
+
+impl Laid {
+    pub fn rows(&self) -> &[LayoutLine] {
+        &self.0
+    }
+
+    /// The row containing byte `index`. A byte at a wrap point belongs to the row it starts.
+    pub fn row_of(&self, index: usize) -> usize {
+        let starts = self.0.iter().map(|row| row.glyphs.iter().map(|g| g.start).min());
+        starts.enumerate().skip(1).rfind(|(_, start)| start.is_some_and(|s| index >= s)).map_or(0, |(i, _)| i)
+    }
+
+    /// The byte closest to `x` on `row`. Past the end of a wrapped row, that is just before
+    /// the break, so the caret stays on the row that was clicked.
+    pub fn byte_at(&self, row: usize, text: &str, x: f32) -> usize {
+        let line = &self.0[row];
+        let wrapped = row + 1 < self.0.len();
+        match line.glyphs.last() {
+            Some(last) if wrapped && x >= last.x + last.w => {
+                let space = text.get(last.start..last.end).is_some_and(|t| t.trim().is_empty());
+                if space {
+                    last.start
+                } else {
+                    last.end
+                }
+            }
+            _ => byte_for_x(line, text, x),
+        }
+    }
+
+    pub fn width(&self) -> f32 {
+        self.0.iter().map(|row| row.w).fold(0.0, f32::max)
+    }
+}
+
 pub struct TextLayout {
     pub metrics: Metrics,
     tab_width: u16,
-    current: HashMap<u64, Rc<LayoutLine>>,
-    previous: HashMap<u64, Rc<LayoutLine>>,
+    current: HashMap<u64, Laid>,
+    previous: HashMap<u64, Laid>,
 }
 
 impl TextLayout {
@@ -206,6 +251,7 @@ impl TextLayout {
         }
     }
 
+    /// Lays out a single row of text (UI labels, line numbers).
     pub fn line(
         &mut self,
         fonts: &mut Fonts,
@@ -213,9 +259,35 @@ impl TextLayout {
         runs: &[StyledRun],
         default_color: u32,
         ui: bool,
-    ) -> Rc<LayoutLine> {
+    ) -> Laid {
+        self.lay_out(fonts, text, runs, default_color, ui, None)
+    }
+
+    /// Lays out editor text, wrapped at `width` pixels when given.
+    pub fn wrapped(
+        &mut self,
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[StyledRun],
+        default_color: u32,
+        width: Option<f32>,
+    ) -> Laid {
+        self.lay_out(fonts, text, runs, default_color, false, width)
+    }
+
+    fn lay_out(
+        &mut self,
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[StyledRun],
+        default_color: u32,
+        ui: bool,
+        width: Option<f32>,
+    ) -> Laid {
         let mut hasher = std::hash::DefaultHasher::new();
-        (text, runs, default_color, ui, self.metrics.font_size.to_bits(), self.tab_width).hash(&mut hasher);
+        let width_bits = width.map(f32::to_bits);
+        (text, runs, default_color, ui, self.metrics.font_size.to_bits(), self.tab_width, width_bits)
+            .hash(&mut hasher);
         let key = hasher.finish();
         if let Some(line) = self.current.get(&key) {
             return line.clone();
@@ -247,21 +319,21 @@ impl TextLayout {
         }
         let shaped = ShapeLine::new(&mut fonts.system, text, &attrs, Shaping::Advanced, self.tab_width);
         // Hinting snaps glyph advances to whole pixels (layout is already in physical pixels).
-        let line = shaped
-            .layout(self.metrics.font_size, None, Wrap::None, None, None, Hinting::Enabled)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| LayoutLine {
+        let wrap = if width.is_some() { Wrap::WordOrGlyph } else { Wrap::None };
+        let mut rows = shaped.layout(self.metrics.font_size, width, wrap, None, None, Hinting::Enabled);
+        if rows.is_empty() {
+            rows.push(LayoutLine {
                 w: 0.0,
                 max_ascent: 0.0,
                 max_descent: 0.0,
                 line_height_opt: None,
                 glyphs: Vec::new(),
             });
-        fonts.used.extend(line.glyphs.iter().map(|g| g.font_id));
-        let line = Rc::new(line);
-        self.current.insert(key, line.clone());
-        line
+        }
+        fonts.used.extend(rows.iter().flat_map(|row| row.glyphs.iter().map(|g| g.font_id)));
+        let laid = Laid(Rc::new(rows));
+        self.current.insert(key, laid.clone());
+        laid
     }
 }
 

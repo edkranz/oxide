@@ -23,6 +23,8 @@ pub struct Settings {
     /// Complete brackets and quotes while typing.
     pub auto_pairs: bool,
     pub caret_blink: bool,
+    /// Wrap long lines at the window's edge (toggle per tab with Alt+Z).
+    pub word_wrap: bool,
     #[serde(rename = "formatter")]
     pub formatters: Vec<Formatter>,
 }
@@ -48,6 +50,7 @@ impl Default for Settings {
             format_on_save: false,
             auto_pairs: true,
             caret_blink: true,
+            word_wrap: false,
             formatters: Vec::new(),
         }
     }
@@ -127,6 +130,7 @@ detect_indentation = true
 
 auto_pairs = true    # complete brackets and quotes as you type
 caret_blink = true
+word_wrap = false    # toggle per tab with Alt+Z
 
 # Format with Shift+Alt+F, or on every save:
 format_on_save = false

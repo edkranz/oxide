@@ -60,6 +60,7 @@ and every push is built and tested on macOS, Windows, and Linux.
 | `Ctrl+Shift+↑/↓` (`Ctrl+Alt+↑/↓` elsewhere), `Cmd+click` (`Ctrl+click`) | Add a cursor |
 | `Escape` | Back to one cursor |
 | `Cmd+/` | Toggle comment |
+| `Alt+Z` | Toggle word wrap for the tab (`word_wrap` in settings sets the default) |
 | `Tab` / `Shift+Tab` | Indent / outdent (whole lines when the selection spans several) |
 | `Alt+←/→` (`Ctrl` elsewhere) | Move by word; add `Shift` to select |
 | `Cmd+←/→`, `Home`/`End` | Line start (smart: indentation first) / end |
@@ -136,7 +137,7 @@ frame to an image.
 2. ~~**Instant re-open**: one running instance; `ox file` hands the path over a socket
    and opens a tab in milliseconds. Hot exit, so unsaved buffers survive quitting.~~ Done.
 3. **Feel**: ~~multiple cursors, auto-closing brackets, comment toggling, settings
-   file~~ (done); word wrap; a minimap.
+   file, word wrap~~ (done); a minimap.
 4. **Add-ons**: ~~declarative formatters, themes, and syntaxes~~ (done); keymaps; then
    sandboxed WASM add-ons for anything needing code. A public registry later.
 5. **LSP as an add-on**, not core. The core will expose popups, underlines, and
@@ -146,7 +147,7 @@ Startup: after the first launch, oxide loads only the font files it used last ti
 (`fonts.json` in its data folder) and scans the rest in the background, so a cold start
 doesn't wait on the whole font library.
 
-Known limits today: lines over 16 KB aren't highlighted; no word wrap.
+Known limits today: lines over 16 KB aren't highlighted.
 
 ## License
 

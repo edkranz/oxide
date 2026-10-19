@@ -7,11 +7,10 @@ use crate::format;
 use crate::highlight::{Batch, Highlighter, StyleCache};
 use crate::input::LineInput;
 use crate::instance::Waiter;
-use crate::render::{blend, byte_for_x, x_for_byte, Canvas, Fonts, TextLayout};
+use crate::render::{blend, x_for_byte, Canvas, Fonts, Laid, TextLayout};
 use crate::session::{TabSnapshot, WindowSnapshot};
 use crate::settings::{self, Settings};
 use crate::UserEvent;
-use cosmic_text::LayoutLine;
 use std::error::Error;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -106,7 +105,10 @@ struct Tab {
     highlighter: Highlighter,
     syntax_name: String,
     scroll_x: f32,
-    scroll_y: f32,
+    /// The view's top: a line, and how far into it (pixels) the view starts.
+    top_line: usize,
+    top_offset: f32,
+    wrap: bool,
     /// Remembered x per caret for up/down, so carets keep their column across short lines.
     goals: Vec<f32>,
     close_armed: Option<Instant>,
@@ -140,7 +142,7 @@ impl Tab {
 /// The bar above the status bar.
 enum Panel {
     Find { query: LineInput, replace: Option<LineInput>, in_replace: bool, anchor: usize },
-    GoTo { input: LineInput, origin: Selection, origin_scroll: (f32, f32) },
+    GoTo { input: LineInput, origin: Selection, origin_scroll: (f32, usize, f32) },
 }
 
 #[derive(Clone, Copy)]
@@ -318,7 +320,10 @@ impl Win {
             highlighter,
             syntax_name: String::new(),
             scroll_x: scroll.0,
-            scroll_y: scroll.1,
+            // The session stores the top as a fractional line, independent of font size.
+            top_line: scroll.1.max(0.0) as usize,
+            top_offset: scroll.1.max(0.0).fract() * self.line_height(),
+            wrap: self.settings.word_wrap,
             goals: Vec::new(),
             close_armed: None,
             matches: None,
@@ -404,7 +409,7 @@ impl Win {
                 unsaved,
                 anchor: sel.anchor,
                 head: sel.head,
-                scroll: (tab.scroll_x, tab.scroll_y),
+                scroll: (tab.scroll_x, tab.top_line as f32 + tab.top_offset / self.line_height()),
             });
         }
         WindowSnapshot { tabs, active }
@@ -531,32 +536,113 @@ impl Win {
         self.gutter_width() + self.char_width()
     }
 
-    fn layout_line(&mut self, fonts: &mut Fonts, line: usize) -> (String, Rc<LayoutLine>) {
+    /// The line's text and its layout: one row, or several when wrapping.
+    fn layout_rows(&mut self, fonts: &mut Fonts, line: usize) -> (String, Laid) {
+        let width = self.wrap_width();
         let tab = &self.tabs[self.active];
         let text = tab.editor.line_text(line);
         let runs = tab.styles.get(line);
         let laid =
-            self.layout.line(fonts, &text, runs.as_deref().unwrap_or(&[]), self.palette.foreground, false);
+            self.layout.wrapped(fonts, &text, runs.as_deref().unwrap_or(&[]), self.palette.foreground, width);
         (text, laid)
     }
 
-    fn caret_x(&mut self, fonts: &mut Fonts) -> f32 {
-        let ed = &self.tab().editor;
-        let line = ed.caret_line();
-        let column = ed.primary().head - ed.doc.text.line_to_char(line);
-        let (text, laid) = self.layout_line(fonts, line);
-        x_for_byte(&laid, char_to_byte(&text, column))
+    /// The wrapping width in pixels for the active tab, if it wraps.
+    fn wrap_width(&self) -> Option<f32> {
+        let available = self.window.inner_size().width as f32 - self.text_left() - self.char_width() * 2.0;
+        self.tab().wrap.then(|| available.max(self.char_width() * 10.0))
+    }
+
+    /// How many rows `line` takes on screen.
+    fn row_count(&mut self, fonts: &mut Fonts, line: usize) -> usize {
+        if self.tab().wrap {
+            self.layout_rows(fonts, line).1.rows().len()
+        } else {
+            1
+        }
+    }
+
+    /// The line and row that `pos` is on, and its x within the row.
+    fn locate(&mut self, fonts: &mut Fonts, pos: usize) -> (usize, usize, f32) {
+        let line = self.tab().editor.doc.text.char_to_line(pos);
+        let column = pos - self.tab().editor.doc.text.line_to_char(line);
+        let (text, laid) = self.layout_rows(fonts, line);
+        let byte = char_to_byte(&text, column);
+        let row = laid.row_of(byte);
+        (line, row, x_for_byte(&laid.rows()[row], byte))
+    }
+
+    /// The position on `row` of `line` closest to `x`.
+    fn pos_in_row(&mut self, fonts: &mut Fonts, line: usize, row: usize, x: f32) -> usize {
+        let (text, laid) = self.layout_rows(fonts, line);
+        let byte = laid.byte_at(row.min(laid.rows().len() - 1), &text, x);
+        self.tab().editor.doc.text.line_to_char(line) + text[..byte].chars().count()
+    }
+
+    /// The row `delta` screen rows away from `row` of `line`; `None` past either end.
+    fn step_rows(
+        &mut self,
+        fonts: &mut Fonts,
+        line: usize,
+        row: usize,
+        delta: isize,
+    ) -> Option<(usize, usize)> {
+        let line_count = self.tab().editor.doc.text.len_lines();
+        let (mut line, mut row) = (line, row as isize + delta);
+        while row < 0 {
+            line = line.checked_sub(1)?;
+            row += self.row_count(fonts, line) as isize;
+        }
+        loop {
+            let rows = self.row_count(fonts, line) as isize;
+            if row < rows {
+                return Some((line, row as usize));
+            }
+            row -= rows;
+            line += 1;
+            if line >= line_count {
+                return None;
+            }
+        }
+    }
+
+    /// Scrolls so the top of `row` of `line` sits `space` pixels below the top of the view.
+    fn scroll_to_row(&mut self, fonts: &mut Fonts, line: usize, row: usize, space: f32) {
+        let line_height = self.line_height();
+        let (mut line, mut above, mut need) = (line, row as f32 * line_height, space.max(0.0));
+        let (top_line, top_offset) = loop {
+            if above >= need {
+                break (line, above - need);
+            }
+            need -= above;
+            if line == 0 {
+                break (0, 0.0);
+            }
+            line -= 1;
+            above = self.row_count(fonts, line) as f32 * line_height;
+        };
+        let tab = self.tab_mut();
+        (tab.top_line, tab.top_offset) = (top_line, top_offset);
     }
 
     /// Char index under the mouse pointer.
     fn hit_text(&mut self, fonts: &mut Fonts) -> usize {
         let (x, y) = self.mouse;
+        let line_height = self.line_height();
         let last = self.tab().editor.doc.text.len_lines() - 1;
-        let y = y - self.text_top() + self.tab().scroll_y;
-        let line = ((y / self.line_height()).floor().max(0.0) as usize).min(last);
-        let (text, laid) = self.layout_line(fonts, line);
-        let byte = byte_for_x(&laid, &text, x - self.text_left() + self.tab().scroll_x);
-        self.tab().editor.doc.text.line_to_char(line) + text[..byte].chars().count()
+        let x = x - self.text_left() + self.tab().scroll_x;
+        let mut y = y - self.text_top() + self.tab().top_offset;
+        let mut line = self.tab().top_line.min(last);
+        loop {
+            let rows = self.row_count(fonts, line);
+            let height = rows as f32 * line_height;
+            if y < height || line == last {
+                let row = ((y.max(0.0) / line_height) as usize).min(rows - 1);
+                return self.pos_in_row(fonts, line, row, x);
+            }
+            y -= height;
+            line += 1;
+        }
     }
 
     fn caret_visible(&self) -> bool {
@@ -645,7 +731,7 @@ impl Win {
                     }
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                self.scroll_by(-dx, -dy);
+                self.scroll_by(fonts, -dx, -dy);
             }
             _ => {}
         }
@@ -718,6 +804,15 @@ impl Win {
         }
         if shift && alt && !ctrl && !mods.super_key() && ch == "f" {
             self.format(false);
+            return Some(Action::None);
+        }
+        if alt && !ctrl && !mods.super_key() && ch == "z" {
+            let tab = self.tab_mut();
+            tab.wrap = !tab.wrap;
+            tab.scroll_x = 0.0;
+            let wrap = tab.wrap;
+            self.notify(if wrap { "Word wrap on" } else { "Word wrap off" });
+            self.after_command(fonts);
             return Some(Action::None);
         }
         let toggle_mods = if MAC { primary && alt } else { alt && !ctrl };
@@ -818,7 +913,7 @@ impl Win {
                     _ => page,
                 };
                 if lines.abs() > 1 {
-                    self.scroll_by(0.0, lines as f32 * self.line_height());
+                    self.scroll_by(fonts, 0.0, lines as f32 * self.line_height());
                 }
                 self.move_vertical(fonts, lines, shift);
                 vertical = true;
@@ -982,7 +1077,7 @@ impl Win {
     fn open_goto(&mut self) {
         self.close_panel(false);
         let tab = self.tab();
-        let origin_scroll = (tab.scroll_x, tab.scroll_y);
+        let origin_scroll = (tab.scroll_x, tab.top_line, tab.top_offset);
         self.panel =
             Some(Panel::GoTo { input: LineInput::new(""), origin: tab.editor.primary(), origin_scroll });
         self.panel_focus = true;
@@ -1001,7 +1096,7 @@ impl Win {
             Some(Panel::GoTo { origin, origin_scroll, .. }) if cancel => {
                 let tab = self.tab_mut();
                 tab.editor.set_selection(origin);
-                (tab.scroll_x, tab.scroll_y) = origin_scroll;
+                (tab.scroll_x, tab.top_line, tab.top_offset) = origin_scroll;
             }
             _ => {}
         }
@@ -1034,8 +1129,8 @@ impl Win {
                 let pos = (start + column).min(ed.line_end(line));
                 ed.set_selection(Selection::caret(pos));
                 // Centre the target line.
-                let target = line as f32 * self.line_height() - self.text_height() / 2.0;
-                self.tab_mut().scroll_y = target.max(0.0);
+                let space = self.text_height() / 2.0;
+                self.scroll_to_row(fonts, line, 0, space);
                 self.reveal(fonts);
             }
             _ => {}
@@ -1326,45 +1421,25 @@ impl Win {
         self.window.request_redraw();
     }
 
-    /// The x position of `pos` within its line.
-    fn x_of(&mut self, fonts: &mut Fonts, pos: usize) -> f32 {
-        let text = &self.tab().editor.doc.text;
-        let line = text.char_to_line(pos);
-        let column = pos - text.line_to_char(line);
-        let (text, laid) = self.layout_line(fonts, line);
-        x_for_byte(&laid, char_to_byte(&text, column))
-    }
-
-    /// The position on `line` closest to `x`, or the document's start or end when `line`
-    /// is out of range.
-    fn pos_at_x(&mut self, fonts: &mut Fonts, line: isize, x: f32) -> usize {
-        let ed = &self.tab().editor;
-        if line < 0 {
-            return 0;
-        }
-        if line as usize >= ed.doc.text.len_lines() {
-            return ed.len();
-        }
-        let line = line as usize;
-        let (text, laid) = self.layout_line(fonts, line);
-        let byte = byte_for_x(&laid, &text, x);
-        self.tab().editor.doc.text.line_to_char(line) + text[..byte].chars().count()
-    }
-
-    /// Moves every caret up or down by `lines`, keeping each one's column.
-    fn move_vertical(&mut self, fonts: &mut Fonts, lines: isize, extend: bool) {
+    /// Moves every caret up or down by `rows` screen rows, keeping each one's column.
+    fn move_vertical(&mut self, fonts: &mut Fonts, rows: isize, extend: bool) {
         let sels = self.tab().editor.sels().to_vec();
         if self.tab().goals.len() != sels.len() {
-            let goals = sels.iter().map(|s| self.x_of(fonts, s.head)).collect();
+            let goals = sels.iter().map(|s| self.locate(fonts, s.head).2).collect();
             self.tab_mut().goals = goals;
         }
         let goals = self.tab().goals.clone();
+        let len = self.tab().editor.len();
         let heads: Vec<usize> = sels
             .iter()
             .zip(&goals)
             .map(|(s, &x)| {
-                let line = self.tab().editor.doc.text.char_to_line(s.head) as isize + lines;
-                self.pos_at_x(fonts, line, x)
+                let (line, row, _) = self.locate(fonts, s.head);
+                match self.step_rows(fonts, line, row, rows) {
+                    Some((line, row)) => self.pos_in_row(fonts, line, row, x),
+                    None if rows < 0 => 0,
+                    None => len,
+                }
             })
             .collect();
         self.ed().set_heads(&heads, extend);
@@ -1374,17 +1449,15 @@ impl Win {
         }
     }
 
-    /// Adds a caret on the line above the first selection, or below the last.
+    /// Adds a caret on the row above the first selection, or below the last.
     fn add_caret_vertically(&mut self, fonts: &mut Fonts, below: bool) {
         let sels = self.tab().editor.sels();
         let edge = if below { *sels.last().unwrap() } else { sels[0] };
-        let x = self.x_of(fonts, edge.head);
-        let line = self.tab().editor.doc.text.char_to_line(edge.head) as isize + if below { 1 } else { -1 };
-        if line < 0 || line as usize >= self.tab().editor.doc.text.len_lines() {
-            return;
+        let (line, row, x) = self.locate(fonts, edge.head);
+        if let Some((line, row)) = self.step_rows(fonts, line, row, if below { 1 } else { -1 }) {
+            let pos = self.pos_in_row(fonts, line, row, x);
+            self.ed().add_selection(Selection::caret(pos));
         }
-        let pos = self.pos_at_x(fonts, line, x);
-        self.ed().add_selection(Selection::caret(pos));
     }
 
     fn click(&mut self, fonts: &mut Fonts, mods: ModifiersState) -> Action {
@@ -1442,33 +1515,69 @@ impl Win {
         Action::None
     }
 
-    fn scroll_by(&mut self, dx: f32, dy: f32) {
+    /// Scrolls by pixels. The view is anchored to its top line, so wrapped lines above it
+    /// never shift what is on screen.
+    fn scroll_by(&mut self, fonts: &mut Fonts, dx: f32, dy: f32) {
         let line_height = self.line_height();
+        let last = self.tab().editor.doc.text.len_lines() - 1;
+        let (mut line, mut offset) = (self.tab().top_line.min(last), self.tab().top_offset + dy);
+        while offset < 0.0 {
+            if line == 0 {
+                offset = 0.0;
+                break;
+            }
+            line -= 1;
+            offset += self.row_count(fonts, line) as f32 * line_height;
+        }
+        loop {
+            let height = self.row_count(fonts, line) as f32 * line_height;
+            if line == last {
+                // The last line may scroll up to the top of the view, no further.
+                offset = offset.min(height - line_height);
+                break;
+            }
+            if offset < height {
+                break;
+            }
+            offset -= height;
+            line += 1;
+        }
+        let wrap = self.tab().wrap;
         let tab = self.tab_mut();
-        let max_y = (tab.editor.doc.text.len_lines() - 1) as f32 * line_height;
-        tab.scroll_x = (tab.scroll_x + dx).max(0.0);
-        tab.scroll_y = (tab.scroll_y + dy).clamp(0.0, max_y);
+        (tab.top_line, tab.top_offset) = (line, offset.max(0.0));
+        tab.scroll_x = if wrap { 0.0 } else { (tab.scroll_x + dx).max(0.0) };
         self.window.request_redraw();
     }
 
-    /// Scrolls just enough to bring the caret into view.
+    /// Scrolls just enough to bring the primary caret into view.
     fn reveal(&mut self, fonts: &mut Fonts) {
         let line_height = self.line_height();
         let height = self.text_height();
-        let x = self.caret_x(fonts);
-        let width = self.window.inner_size().width as f32 - self.text_left();
-        let margin = self.char_width() * 4.0;
-        let tab = self.tab_mut();
-        let top = tab.editor.caret_line() as f32 * line_height;
-        if top < tab.scroll_y {
-            tab.scroll_y = top;
-        } else if top + line_height > tab.scroll_y + height {
-            tab.scroll_y = top + line_height - height;
+        let (line, row, x) = self.locate(fonts, self.tab().editor.primary().head);
+        let row_top = row as f32 * line_height;
+        let (top_line, top_offset) = (self.tab().top_line, self.tab().top_offset);
+        if line < top_line || (line == top_line && row_top < top_offset) {
+            self.scroll_to_row(fonts, line, row, 0.0);
+        } else {
+            // Walk down from the top of the view, stopping once past its bottom.
+            let (mut y, mut l) = (-top_offset, top_line);
+            while l < line && y <= height {
+                y += self.row_count(fonts, l) as f32 * line_height;
+                l += 1;
+            }
+            if l < line || y + row_top + line_height > height {
+                self.scroll_to_row(fonts, line, row, height - line_height);
+            }
         }
-        if x < tab.scroll_x {
-            tab.scroll_x = (x - width / 3.0).max(0.0);
-        } else if x > tab.scroll_x + width - margin {
-            tab.scroll_x = x - width + margin;
+        if !self.tab().wrap {
+            let width = self.window.inner_size().width as f32 - self.text_left();
+            let margin = self.char_width() * 4.0;
+            let tab = self.tab_mut();
+            if x < tab.scroll_x {
+                tab.scroll_x = (x - width / 3.0).max(0.0);
+            } else if x > tab.scroll_x + width - margin {
+                tab.scroll_x = x - width + margin;
+            }
         }
     }
 
@@ -1520,24 +1629,28 @@ impl Win {
         let p = self.palette;
 
         let line_count = self.tab().editor.doc.text.len_lines();
-        let scroll_y = self.tab().scroll_y;
-        let first = (scroll_y / line_height) as usize;
-        let last = (((scroll_y + text_bottom - text_top) / line_height).ceil() as usize + 1).min(line_count);
+        let top_line = self.tab().top_line.min(line_count - 1);
+        let top_offset = self.tab().top_offset;
+        let wrapping = self.tab().wrap;
         let sels: Vec<Selection> = self.tab().editor.sels().to_vec();
         let sel = self.tab().editor.primary();
         let caret_line = self.tab().editor.caret_line();
         let caret_on = self.caret_visible();
 
-        // Shape visible lines first; painting below only borrows the results.
-        let mut lines = Vec::with_capacity(last.saturating_sub(first));
+        // Lay out the visible lines first; painting below only borrows the results.
+        let mut lines = Vec::new();
         let mut widest: f32 = 0.0;
-        for line in first..last {
-            let (text, laid) = self.layout_line(fonts, line);
-            widest = widest.max(laid.w);
-            lines.push((line, text, laid));
+        let (mut y, mut line) = (text_top - top_offset, top_line);
+        while line < line_count && y < text_bottom {
+            let (text, laid) = self.layout_rows(fonts, line);
+            widest = widest.max(laid.width());
+            let line_top = y;
+            y += laid.rows().len() as f32 * line_height;
+            lines.push((line, line_top, text, laid));
+            line += 1;
         }
         let max_scroll_x = (widest - (width - text_left) / 2.0).max(0.0);
-        let scroll_x = self.tab().scroll_x.min(max_scroll_x);
+        let scroll_x = if wrapping { 0.0 } else { self.tab().scroll_x.min(max_scroll_x) };
         self.tab_mut().scroll_x = scroll_x;
         let x0 = text_left - scroll_x;
 
@@ -1559,46 +1672,57 @@ impl Win {
         let ed = &tab.editor;
         let mut caret_rect = None;
 
-        for (line, text, laid) in &lines {
-            let line = *line;
-            let top = text_top + line as f32 * line_height - scroll_y;
+        for (line, top, text, laid) in &lines {
+            let (line, top) = (*line, *top);
+            let rows = laid.rows();
+            let row_top = |row: usize| top + row as f32 * line_height;
             let line_start = ed.doc.text.line_to_char(line);
             let line_end = ed.line_end(line);
+            let byte = |pos: usize| char_to_byte(text, pos - line_start);
             // Selections that touch this line, found by binary search (there may be many).
             let from = sels.partition_point(|s| s.end() < line_start);
             let here: Vec<Selection> =
                 sels[from..].iter().take_while(|s| s.start() <= line_end).copied().collect();
             let caret_here = |s: &Selection| s.head >= line_start && s.head <= line_end;
             if here.iter().any(|s| s.is_empty() && caret_here(s)) {
-                canvas.fill(0.0, top, width, top + line_height, p.line_highlight);
+                canvas.fill(0.0, top, width, row_top(rows.len()), p.line_highlight);
             }
-            let x_of = |pos: usize| x0 + x_for_byte(laid, char_to_byte(text, pos - line_start));
 
             if let Ok(matches) = &matches {
                 let from = matches.partition_point(|m| m.1 < line_start);
                 for &(start, end) in matches[from..].iter().take_while(|m| m.0 <= line_end) {
-                    let (xa, xb) = (x_of(start.max(line_start)), x_of(end.min(line_end)));
-                    let thickness = (caret_width / 2.0).max(1.0);
-                    canvas.outline(
-                        xa.max(text_left),
-                        top + 1.0,
-                        xb.max(text_left),
-                        top + line_height - 1.0,
-                        thickness,
-                        p.find_highlight,
-                    );
+                    let (a, b) = (byte(start.max(line_start)), byte(end.min(line_end)));
+                    for (row, xa, xb) in row_spans(laid, text.len(), a, b) {
+                        let (y0, y1) = (row_top(row) + 1.0, row_top(row + 1) - 1.0);
+                        let thickness = (caret_width / 2.0).max(1.0);
+                        let (xa, xb) = ((x0 + xa).max(text_left), (x0 + xb).max(text_left));
+                        canvas.outline(xa, y0, xb, y1, thickness, p.find_highlight);
+                    }
                 }
             }
             for s in here.iter().filter(|s| !s.is_empty()) {
-                let xa = x_of(s.start().max(line_start));
-                let mut xb = x_of(s.end().min(line_end));
-                if s.end() > line_end {
-                    xb += char_width * 0.6; // the selected line break
+                let (a, b) = (byte(s.start().max(line_start)), byte(s.end().min(line_end)));
+                for (row, xa, xb) in row_spans(laid, text.len(), a, b) {
+                    let (xa, xb) = ((x0 + xa).max(text_left), (x0 + xb).max(text_left));
+                    canvas.fill(xa, row_top(row), xb, row_top(row + 1), p.selection);
                 }
-                canvas.fill(xa.max(text_left), top, xb.max(text_left), top + line_height, p.selection);
+                if s.end() > line_end {
+                    // The selected line break, after the last row's text.
+                    let last = rows.len() - 1;
+                    let x = x0 + x_for_byte(&rows[last], text.len());
+                    canvas.fill(
+                        x.max(text_left),
+                        row_top(last),
+                        x + char_width * 0.6,
+                        row_top(last + 1),
+                        p.selection,
+                    );
+                }
             }
 
-            canvas.text(fonts, laid, x0, top + baseline, text_left, width);
+            for (row, laid_row) in rows.iter().enumerate() {
+                canvas.text(fonts, laid_row, x0, row_top(row) + baseline, text_left, width);
+            }
 
             let color = if here.iter().any(caret_here) { p.gutter_active } else { p.gutter };
             let number = self.layout.line(fonts, &(line + 1).to_string(), &[], color, false);
@@ -1606,7 +1730,9 @@ impl Win {
             canvas.text(fonts, &number, nx, top + baseline, 0.0, gutter_width);
 
             for s in here.iter().filter(|s| caret_here(s)) {
-                let x = x_of(s.head);
+                let b = byte(s.head);
+                let row = laid.row_of(b);
+                let (x, top) = (x0 + x_for_byte(&rows[row], b), row_top(row));
                 let is_primary = *s == sel;
                 if is_primary {
                     caret_rect = Some((x, top));
@@ -1616,13 +1742,8 @@ impl Win {
                     Some(preedit) if is_primary => {
                         canvas.fill(x, top, x + preedit.w, top + line_height, p.background);
                         canvas.text(fonts, preedit, x, top + baseline, text_left, width);
-                        canvas.fill(
-                            x,
-                            top + baseline + 2.0,
-                            x + preedit.w,
-                            top + baseline + 3.0,
-                            p.foreground,
-                        );
+                        let underline = top + baseline + 2.0;
+                        canvas.fill(x, underline, x + preedit.w, underline + 1.0, p.foreground);
                     }
                     _ if x >= text_left - 1.0 && !self.panel_focus && caret_on => {
                         canvas.fill(x, top, x + caret_width, top + line_height, p.caret);
@@ -1795,6 +1916,25 @@ impl Win {
             }
         }
     }
+}
+
+/// The parts of bytes `a..b` on each row of `laid`, as `(row, x0, x1)`.
+fn row_spans(laid: &Laid, text_len: usize, a: usize, b: usize) -> Vec<(usize, f32, f32)> {
+    let rows = laid.rows();
+    let start_of = |r: usize| {
+        if r == 0 {
+            0
+        } else {
+            rows.get(r).and_then(|row| row.glyphs.iter().map(|g| g.start).min()).unwrap_or(text_len)
+        }
+    };
+    (0..rows.len())
+        .filter_map(|r| {
+            let (s, e) =
+                (a.max(start_of(r)), b.min(if r + 1 < rows.len() { start_of(r + 1) } else { text_len }));
+            (s < e).then(|| (r, x_for_byte(&rows[r], s), x_for_byte(&rows[r], e)))
+        })
+        .collect()
 }
 
 /// Text a key press should type, if any. Shortcuts and control characters type nothing.
