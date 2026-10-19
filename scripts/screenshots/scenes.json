@@ -1,0 +1,66 @@
+{
+  "editor": {
+    "tabs": [
+      {
+        "file": "src/editor.rs",
+        "line": 586,
+        "col": 34,
+        "top": 570
+      },
+      {
+        "file": "src/main.rs"
+      },
+      {
+        "file": "README.md"
+      },
+      {
+        "file": "Cargo.toml"
+      }
+    ]
+  },
+  "multiple-cursors": {
+    "tabs": [
+      {
+        "file": "src/editor.rs",
+        "line": 576,
+        "word": "close",
+        "top": 570
+      },
+      {
+        "file": "src/find.rs"
+      }
+    ],
+    "menu": [
+      "Selection:Select All Occurrences"
+    ]
+  },
+  "find": {
+    "tabs": [
+      {
+        "file": "src/find.rs",
+        "line": 40,
+        "word": "text",
+        "top": 28
+      },
+      {
+        "file": "src/editor.rs"
+      }
+    ],
+    "menu": [
+      "Find:Find…"
+    ]
+  },
+  "light-theme": {
+    "theme": "base16-ocean.light",
+    "tabs": [
+      {
+        "file": "scripts/screenshots/shoot.py",
+        "line": 20,
+        "top": 0
+      },
+      {
+        "file": "scripts/screenshots/scenes.json"
+      }
+    ]
+  }
+}

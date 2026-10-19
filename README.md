@@ -1,41 +1,129 @@
-# oxide
+<p align="center">
+  <img src="assets/banner.png" alt="oxide: a super light text editor, built in Rust" width="100%">
+</p>
 
-oxide is a super light text editor built in Rust.
-Not an IDE: it opens instantly, edits text well, and leaves the rest to add-ons.
+<p align="center">
+  <a href="https://github.com/edkranz/oxide/releases/latest"><img src="https://img.shields.io/github/v/release/edkranz/oxide?color=e8743b&label=release" alt="Latest release"></a>
+  <a href="https://github.com/edkranz/oxide/actions/workflows/ci.yml"><img src="https://github.com/edkranz/oxide/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/edkranz/oxide/releases"><img src="https://img.shields.io/github/downloads/edkranz/oxide/total?color=4c9a5c" alt="Downloads"></a>
+  <img src="https://img.shields.io/badge/rust-1.88%2B-b7410e?logo=rust" alt="Rust 1.88+">
+  <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-5b6b84" alt="macOS, Windows, Linux">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/edkranz/oxide?color=5b6b84" alt="MIT license"></a>
+  <a href="https://github.com/edkranz/oxide/stargazers"><img src="https://img.shields.io/github/stars/edkranz/oxide?style=flat&color=e3b341" alt="Stars"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#keyboard-shortcuts">Shortcuts</a> ·
+  <a href="#settings-and-formatters">Settings</a> ·
+  <a href="#roadmap">Roadmap</a>
+</p>
+
+oxide is a super light text editor built in Rust. It's for the edits you make all day:
+`ox file` from a terminal, fix a few lines, save, close. It opens before you've finished
+thinking about it, highlights your code, formats it on save, and stays out of the way.
+It's not an IDE, and doesn't want to be.
+
+<p align="center">
+  <img src="assets/screenshots/editor.png" alt="oxide editing Rust code with tabs" width="900">
+</p>
+
+## At a glance
+
+| | |
+| --- | --- |
+| **~100 ms** | from launch to the first frame on screen |
+| **< 10 ms** | for `ox file` to open a tab in the running editor |
+| **5.6 MB** | one native binary, no runtime, no Electron |
+| **0% CPU** | when idle: nothing redraws unless something changed |
+
+Measured on an M4 Pro MacBook; startup assumes oxide has run once and cached its font list.
 
 ## Install
 
-**macOS:** build the app, install it in `/Applications`, and put the `ox` command on your PATH:
+**macOS** (Homebrew):
 
 ```sh
-scripts/install-macos.sh
+brew install --cask edkranz/tap/oxide
 ```
 
-Then open files from a terminal, Finder ("Open With", or drop on the Dock icon), or Launchpad:
+This installs `Oxide.app` and the `ox` command. `brew upgrade` keeps it up to date.
+
+**Linux**: a `.deb` for Debian and Ubuntu, or a one-line install for everything else
+(it puts `oxide` and `ox` in `~/.local/bin`, with a desktop entry):
 
 ```sh
-ox file.rs other.md          # opens each file in a tab
-ox --wait COMMIT_EDITMSG     # blocks until those tabs close: git config core.editor "ox --wait"
+# Debian / Ubuntu (x64 shown; arm64 builds are there too)
+curl -LO https://github.com/edkranz/oxide/releases/latest/download/oxide_amd64.deb
+sudo apt install ./oxide_amd64.deb
+
+# Any distro
+curl -fsSL https://raw.githubusercontent.com/edkranz/oxide/main/scripts/install.sh | sh
 ```
 
-Only one copy of Oxide runs: `ox` hands its files to it over a local socket and returns in
-a few milliseconds. Quitting keeps your tabs and any unsaved text (hot exit) and brings them
-back next time; the session is also saved a couple of seconds after each change, so a crash
-loses little.
+**Windows**: download `Oxide-windows-x64.zip` from the
+[latest release](https://github.com/edkranz/oxide/releases/latest), unzip it, and put the
+folder on your `PATH` to get `ox`.
 
-`APP_DIR` and `BIN_DIR` change where it installs (default `/Applications` and `~/.local/bin`).
-Run the script again to update.
+**From source** (any platform, Rust 1.88+):
 
-**Linux:** `scripts/install-linux.sh` builds oxide and installs `oxide` and `ox` into
-`~/.local/bin`, with a desktop entry and icon. Release tarballs include the same script.
+```sh
+git clone https://github.com/edkranz/oxide && cd oxide
+scripts/install-macos.sh    # macOS: builds Oxide.app into /Applications and links ox
+scripts/install-linux.sh    # Linux: installs into ~/.local
+cargo build --release       # anywhere: target/release/oxide
+```
 
-**Windows:** unzip a release and put the folder on your `PATH`; `ox.cmd` and `oxide.exe`
-work the same way as on macOS. Or `cargo build --release`.
+Every release lists SHA-256 checksums in `SHA256SUMS.txt`.
 
-Prebuilt packages for all three come from the [Release workflow](.github/workflows/release.yml),
-and every push is built and tested on macOS, Windows, and Linux.
+## Use it
 
-## Keys
+```sh
+ox notes.md src/main.rs      # opens each file in a tab
+ox --wait COMMIT_EDITMSG     # waits until those tabs close
+git config --global core.editor "ox --wait"
+```
+
+Or open files from Finder ("Open With", or drop them on the Dock icon), or the app launcher.
+
+Only one oxide runs at a time: `ox` hands its files to it over a local socket and returns
+straight away. Quitting keeps your tabs and any unsaved text, and brings them back next
+time (hot exit). The session is also saved a couple of seconds after each change, so a
+crash loses little.
+
+## Features
+
+<table>
+  <tr>
+    <td width="50%"><img src="assets/screenshots/multiple-cursors.png" alt="Fifteen cursors editing at once"></td>
+    <td width="50%"><img src="assets/screenshots/find.png" alt="The find bar with live match count"></td>
+  </tr>
+  <tr>
+    <td><b>Multiple cursors.</b> Add the next match with <code>Cmd+D</code>, select every match,
+    split a selection into lines, or <code>Cmd+click</code>. Every command works on every cursor
+    as one undo step.</td>
+    <td><b>Find and replace</b> live as you type, with regex, case and whole-word toggles, and a
+    match count. Go to any line with <code>Ctrl+G</code>.</td>
+  </tr>
+  <tr>
+    <td><img src="assets/screenshots/light-theme.png" alt="oxide with a light theme, editing Python"></td>
+    <td valign="top">
+      <ul>
+        <li><b>Syntax highlighting</b> for dozens of languages, in a background thread that never
+        holds up typing. Add more with <code>.sublime-syntax</code> grammars.</li>
+        <li><b>Formatters</b> of your choice (rustfmt, prettier, black, …), on demand or on save.</li>
+        <li><b>Themes</b>: built-in light and dark ones, or any <code>.tmTheme</code>.</li>
+        <li><b>Hot exit</b>, atomic saves, word wrap, auto-closing brackets, comment toggling,
+        smart indentation, zoom.</li>
+        <li><b>Native menus</b> on macOS, input methods for every language, and emoji-aware
+        cursor movement.</li>
+      </ul>
+    </td>
+  </tr>
+</table>
+
+## Keyboard shortcuts
 
 `Cmd` on macOS, `Ctrl` elsewhere. On macOS the same commands are in the menu bar.
 
@@ -75,27 +163,6 @@ complete as you type (and step over / delete as a pair); Enter between brackets 
 indented line. The caret moves over emoji and accented letters as single characters.
 Input methods (Chinese, Japanese, Korean, accented characters) are supported.
 
-## How it works
-
-Two rules keep it fast: own the whole rendering pipeline, and keep anything slow off the
-thread that handles typing.
-
-- **`document.rs`**: the text as a rope (`ropey`), so edits are O(log n) on any size of file,
-  with undo history and saved/dirty tracking.
-- **`editor.rs`**: editing commands that only need the text (typing, deleting, word moves).
-- **`highlight.rs`**: a background thread per document runs regex-based syntax grammars
-  (`syntect`). It stores parser state at each line start, so after an edit it
-  re-parses only until the state converges with the previous pass, usually a line or two.
-  The UI draws plain text until colours arrive and never waits for them.
-- **`render.rs`**: CPU rendering, which starts faster than a GPU pipeline. `cosmic-text` shapes lines
-  (with font fallback), `swash` rasterises glyphs, and pixels are blended straight into the
-  window buffer (`softbuffer`). Shaped lines are cached between frames.
-- **`find.rs`**: find and replace on top of the `regex` crate; literal queries are escaped
-  so both modes share one path.
-- **`instance.rs`** and **`session.rs`**: the single running instance and hot exit.
-- **`window.rs`**: tabs, the find and go-to bar, input, scrolling, and painting a frame. Nothing redraws unless something
-  changed, so an idle window uses no CPU.
-
 ## Settings and formatters
 
 `Cmd+,` opens `~/.config/oxide/settings.toml` (`%APPDATA%\oxide\settings.toml` on Windows),
@@ -131,6 +198,27 @@ Drop syntax definitions (`.sublime-syntax` YAML grammars) into `~/.config/oxide/
 Debugging: `OXIDE_TRACE=1` prints startup timings; `OXIDE_SNAPSHOT=frame.bmp` writes every
 frame to an image.
 
+## How it works
+
+Two rules keep it fast: own the whole rendering pipeline, and keep anything slow off the
+thread that handles typing.
+
+- **`document.rs`**: the text as a rope (`ropey`), so edits are O(log n) on any size of file,
+  with undo history and saved/dirty tracking.
+- **`editor.rs`**: editing commands that only need the text (typing, deleting, word moves).
+- **`highlight.rs`**: a background thread per document runs regex-based syntax grammars
+  (`syntect`). It stores parser state at each line start, so after an edit it
+  re-parses only until the state converges with the previous pass, usually a line or two.
+  The UI draws plain text until colours arrive and never waits for them.
+- **`render.rs`**: CPU rendering, which starts faster than a GPU pipeline. `cosmic-text` shapes lines
+  (with font fallback), `swash` rasterises glyphs, and pixels are blended straight into the
+  window buffer (`softbuffer`). Shaped lines are cached between frames.
+- **`find.rs`**: find and replace on top of the `regex` crate; literal queries are escaped
+  so both modes share one path.
+- **`instance.rs`** and **`session.rs`**: the single running instance and hot exit.
+- **`window.rs`**: tabs, the find and go-to bar, input, scrolling, and painting a frame. Nothing redraws unless something
+  changed, so an idle window uses no CPU.
+
 ## Roadmap
 
 1. ~~**Daily-driver basics**: find and replace, go to line, tabs, open and save-as
@@ -150,6 +238,25 @@ doesn't wait on the whole font library.
 
 Known limits today: lines over 16 KB aren't highlighted; Windows and Linux have no menu
 bar yet (every command has a shortcut).
+
+## Releases and contributing
+
+Versions come from commit messages, written as
+[conventional commits](https://www.conventionalcommits.org): `feat: …` for a new feature,
+`fix: …` for a bug fix, `docs:`, `ci:`, `chore:` and so on for everything else.
+[release-please](https://github.com/googleapis/release-please) keeps a release PR open
+with the next version number and changelog. Merging it tags the release, and the
+[release workflow](.github/workflows/release.yml) builds macOS, Windows and Linux packages,
+attaches them to the GitHub release, and updates the Homebrew cask.
+
+Every push is built, linted and tested on macOS, Windows and Linux by [CI](.github/workflows/ci.yml).
+Issues and pull requests are welcome.
+
+## Star history
+
+<a href="https://star-history.com/#edkranz/oxide&Date">
+  <img src="https://api.star-history.com/svg?repos=edkranz/oxide&type=Date" alt="Star history chart" width="600">
+</a>
 
 ## License
 
