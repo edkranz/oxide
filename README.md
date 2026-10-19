@@ -26,7 +26,14 @@ loses little.
 `APP_DIR` and `BIN_DIR` change where it installs (default `/Applications` and `~/.local/bin`).
 Run the script again to update.
 
-**Elsewhere:** `cargo build --release` and run `target/release/oxide <file>`.
+**Linux:** `scripts/install-linux.sh` builds oxide and installs `oxide` and `ox` into
+`~/.local/bin`, with a desktop entry and icon. Release tarballs include the same script.
+
+**Windows:** unzip a release and put the folder on your `PATH`; `ox.cmd` and `oxide.exe`
+work the same way as on macOS. Or `cargo build --release`.
+
+Prebuilt packages for all three come from the [Release workflow](.github/workflows/release.yml),
+and every push is built and tested on macOS, Windows, and Linux.
 
 ## Keys
 

@@ -13,7 +13,10 @@ bin_dir=${BIN_DIR:-$HOME/.local/bin}
 identifier=io.github.edkranz.oxide
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n 1)
 
-cargo build --release --manifest-path "$root/Cargo.toml"
+# OXIDE_SKIP_BUILD=1 packages an existing target/release/oxide (CI builds a universal one).
+if [ -z "${OXIDE_SKIP_BUILD:-}" ]; then
+    cargo build --release --manifest-path "$root/Cargo.toml"
+fi
 
 bundle="$root/target/release/Oxide.app"
 rm -rf "$bundle"

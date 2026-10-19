@@ -213,6 +213,9 @@ impl Win {
             .with_title("oxide")
             .with_inner_size(LogicalSize::new(960.0, 680.0))
             .with_visible(false);
+        // Lets Linux desktops match the window to oxide.desktop (and its icon).
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+        let attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "oxide", "oxide");
         let window = Rc::new(event_loop.create_window(attrs)?);
         window.set_ime_allowed(true);
         let context = softbuffer::Context::new(window.clone())?;

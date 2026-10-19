@@ -1,0 +1,89 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds every platform and publishes a GitHub release.
+# Running it by hand builds the same packages as downloadable artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build a universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/oxide \
+            target/aarch64-apple-darwin/release/oxide target/x86_64-apple-darwin/release/oxide
+      - name: Bundle
+        run: |
+          OXIDE_SKIP_BUILD=1 scripts/install-macos.sh --bundle-only
+          mkdir -p dist
+          ditto -c -k --keepParent target/release/Oxide.app dist/Oxide-macos-universal.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/oxide | Out-Null
+          Copy-Item target/release/oxide.exe, packaging/windows/ox.cmd, README.md, LICENSE dist/oxide/
+          Compress-Archive -Path dist/oxide -DestinationPath dist/Oxide-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist/oxide
+          cp target/release/oxide packaging/linux/oxide.desktop packaging/linux/oxide.png \
+            scripts/install-linux.sh README.md LICENSE dist/oxide/
+          tar -C dist -czf dist/Oxide-linux-x64.tar.gz oxide
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
