@@ -1,0 +1,6 @@
+#!/bin/sh
+# Opens files in Oxide: `ox file ...`, or `ox --wait file` to block until the window closes.
+# Lives inside Oxide.app; the installer symlinks it onto your PATH.
+self=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+contents=$(cd "$(dirname "$self")/../.." && pwd -P)
+exec "$contents/MacOS/oxide" "$@"

@@ -3,11 +3,25 @@
 oxide is a super light text editor built in Rust.
 Not an IDE: it opens instantly, edits text well, and leaves the rest to add-ons.
 
+## Install
+
+**macOS:** build the app, install it in `/Applications`, and put the `ox` command on your PATH:
+
 ```sh
-cargo build --release
-./target/release/oxide path/to/file      # returns to the shell immediately
-./target/release/oxide --wait file       # blocks until the window closes (for `git commit`)
+scripts/install-macos.sh
 ```
+
+Then open files from a terminal (it returns straight away), or launch Oxide from Launchpad:
+
+```sh
+ox file.rs other.md          # opens each file in a tab
+ox --wait COMMIT_EDITMSG     # blocks until the window closes: git config core.editor "ox --wait"
+```
+
+`APP_DIR` and `BIN_DIR` change where it installs (default `/Applications` and `~/.local/bin`).
+Run the script again to update.
+
+**Elsewhere:** `cargo build --release` and run `target/release/oxide <file>`.
 
 ## Keys
 
