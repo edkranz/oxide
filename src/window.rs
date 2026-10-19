@@ -86,6 +86,7 @@ pub enum Command {
 }
 
 /// What the menu bar shows as ticked for the focused window.
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MenuState {
     pub word_wrap: bool,
@@ -468,6 +469,7 @@ impl Win {
         self.tabs.iter().any(|t| t.editor.doc.is_dirty())
     }
 
+    #[cfg(target_os = "macos")]
     pub fn menu_state(&self) -> MenuState {
         MenuState { word_wrap: self.tab().wrap, find: self.find_options }
     }

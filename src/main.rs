@@ -259,6 +259,7 @@ impl App {
         self.apply(event_loop, id, action);
     }
 
+    #[cfg(target_os = "macos")]
     fn focused_window(&self) -> Option<WindowId> {
         self.last_focused
             .filter(|id| self.windows.contains_key(id))
