@@ -4,7 +4,8 @@ name: Release
 # release, then points the Homebrew cask at the new version.
 #
 # release-please.yml calls this when it cuts a release. Run it by hand with an existing
-# tag to rebuild that release's packages.
+# tag to rebuild that release's packages, or with a branch name (like main) to build
+# the packages as workflow artifacts without publishing anything.
 on:
   workflow_call:
     inputs:
@@ -14,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build, like v0.2.0
+        description: Release tag to build, like v0.2.0 (or a branch, to build without publishing)
         type: string
         required: true
 
@@ -92,13 +93,15 @@ jobs:
             scripts/install-linux.sh README.md LICENSE dist/oxide/
           tar -C dist -czf dist/Oxide-linux-${{ matrix.arch }}.tar.gz oxide
           rm -r dist/oxide
-          scripts/package-deb.sh target/release/oxide "${TAG#v}" ${{ matrix.deb }} dist
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          scripts/package-deb.sh target/release/oxide "$version" ${{ matrix.deb }} dist
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
           path: dist/*
 
   publish:
+    if: startsWith(inputs.tag, 'v')
     needs: [macos, windows, linux]
     runs-on: ubuntu-latest
     permissions:
