@@ -123,8 +123,9 @@ impl TextLayout {
             }
         }
         let shaped = ShapeLine::new(&mut fonts.system, text, &attrs, Shaping::Advanced, TAB_WIDTH);
+        // Hinting snaps glyph advances to whole pixels (layout is already in physical pixels).
         let line = shaped
-            .layout(self.metrics.font_size, None, Wrap::None, None, None, Hinting::Disabled)
+            .layout(self.metrics.font_size, None, Wrap::None, None, None, Hinting::Enabled)
             .into_iter()
             .next()
             .unwrap_or_else(|| LayoutLine {
@@ -206,6 +207,9 @@ impl Canvas<'_> {
 
     /// Draws `line` with its left edge at `x` and baseline at `y`, clipped to `clip_x0..clip_x1`.
     pub fn text(&mut self, fonts: &mut Fonts, line: &LayoutLine, x: f32, y: f32, clip_x0: f32, clip_x1: f32) {
+        // Whole-pixel origins plus hinted layout put every glyph on the pixel grid, so
+        // each copy of a letter rasterises identically.
+        let (x, y) = (x.round(), y.round());
         for glyph in &line.glyphs {
             if x + glyph.x + glyph.w < clip_x0 {
                 continue;
