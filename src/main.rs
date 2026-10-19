@@ -10,6 +10,8 @@ mod input;
 mod instance;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod menu;
 mod render;
 mod session;
 mod settings;
@@ -21,7 +23,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use syntect::highlighting::Theme;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
@@ -45,6 +47,9 @@ pub enum UserEvent {
     FontsReady(cosmic_text::fontdb::Database),
     /// A formatter finished for a tab that had text `version`.
     Formatted { window: WindowId, tab: u64, version: u64, result: Result<String, String>, then_save: bool },
+    /// An item was chosen from the menu bar.
+    #[cfg(target_os = "macos")]
+    Menu(muda::MenuId),
 }
 
 /// `~/.config/oxide` (or `%APPDATA%\oxide`): where add-ons such as syntaxes live.
@@ -87,6 +92,8 @@ struct App {
     modifiers: ModifiersState,
     quit_armed: Option<Instant>,
     session_due: Option<Instant>,
+    #[cfg(target_os = "macos")]
+    menu: Option<menu::MenuBar>,
 }
 
 impl App {
@@ -210,6 +217,54 @@ impl App {
         self.clipboard.as_mut()
     }
 
+    /// Carries out what window `id` asked for.
+    fn apply(&mut self, event_loop: &ActiveEventLoop, id: WindowId, action: Action) {
+        let Some(win) = self.windows.get_mut(&id) else { return };
+        match action {
+            Action::None => {}
+            Action::Close => {
+                if win.confirm_close() {
+                    self.windows.remove(&id);
+                    self.session_due.get_or_insert_with(|| Instant::now() + SESSION_DELAY);
+                    if self.windows.is_empty() {
+                        event_loop.exit();
+                    }
+                }
+            }
+            Action::Quit => self.quit(event_loop),
+            Action::Copy(text) => {
+                if let Some(clipboard) = self.clipboard() {
+                    let _ = clipboard.set_text(text);
+                }
+            }
+            Action::Paste => {
+                let text = self.clipboard().and_then(|c| c.get_text().ok());
+                if let (Some(text), Some(win)) = (text, self.windows.get_mut(&id)) {
+                    win.paste(self.fonts.as_mut().unwrap(), &text);
+                }
+            }
+            Action::NewWindow => {
+                self.open_window(event_loop, Vec::new(), 0);
+            }
+        }
+    }
+
+    /// Runs a menu bar command in the focused window.
+    #[cfg(target_os = "macos")]
+    fn menu_command(&mut self, event_loop: &ActiveEventLoop, item: muda::MenuId) {
+        let Some(command) = self.menu.as_ref().and_then(|m| m.command(&item)) else { return };
+        let Some(id) = self.focused_window() else { return };
+        let fonts = self.fonts.as_mut().expect("fonts load before the first window");
+        let action = self.windows.get_mut(&id).unwrap().run(fonts, command);
+        self.apply(event_loop, id, action);
+    }
+
+    fn focused_window(&self) -> Option<WindowId> {
+        self.last_focused
+            .filter(|id| self.windows.contains_key(id))
+            .or_else(|| self.windows.keys().next().copied())
+    }
+
     fn quit(&mut self, event_loop: &ActiveEventLoop) {
         // With a session, unsaved work is kept rather than discarded, so just go.
         if self.primary {
@@ -259,6 +314,18 @@ fn restore_tab(tab: TabState) -> Option<TabInit> {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
+        // AppKit has finished launching by the first event, so the menu bar can go in.
+        #[cfg(target_os = "macos")]
+        if cause == StartCause::Init {
+            let proxy = std::sync::Mutex::new(self.proxy.clone());
+            self.menu = Some(menu::MenuBar::install(move |item| {
+                let _ = proxy.lock().unwrap().send_event(UserEvent::Menu(item));
+            }));
+        }
+        let _ = cause;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if !self.windows.is_empty() {
             return;
@@ -301,6 +368,8 @@ impl ApplicationHandler<UserEvent> for App {
                     win.apply_format(fonts, tab, version, result, then_save);
                 }
             }
+            #[cfg(target_os = "macos")]
+            UserEvent::Menu(item) => self.menu_command(event_loop, item),
         }
     }
 
@@ -323,33 +392,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             event => win.handle(fonts, event, self.modifiers),
         };
-        match action {
-            Action::None => {}
-            Action::Close => {
-                if win.confirm_close() {
-                    self.windows.remove(&id);
-                    self.session_due.get_or_insert_with(|| Instant::now() + SESSION_DELAY);
-                    if self.windows.is_empty() {
-                        event_loop.exit();
-                    }
-                }
-            }
-            Action::Quit => self.quit(event_loop),
-            Action::Copy(text) => {
-                if let Some(clipboard) = self.clipboard() {
-                    let _ = clipboard.set_text(text);
-                }
-            }
-            Action::Paste => {
-                let text = self.clipboard().and_then(|c| c.get_text().ok());
-                if let (Some(text), Some(win)) = (text, self.windows.get_mut(&id)) {
-                    win.paste(self.fonts.as_mut().unwrap(), &text);
-                }
-            }
-        }
+        self.apply(event_loop, id, action);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if let (Some(menu), Some(id)) = (self.menu.as_mut(), self.last_focused) {
+            if let Some(win) = self.windows.get(&id) {
+                menu.show(win.menu_state());
+            }
+        }
         let mut settings_saved = false;
         for win in self.windows.values_mut() {
             settings_saved |= win.take_settings_saved();
@@ -487,6 +539,8 @@ fn main() {
         modifiers: ModifiersState::empty(),
         quit_armed: None,
         session_due: None,
+        #[cfg(target_os = "macos")]
+        menu: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }

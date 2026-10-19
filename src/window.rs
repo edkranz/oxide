@@ -41,6 +41,55 @@ pub enum Action {
     Quit,
     Copy(String),
     Paste,
+    NewWindow,
+}
+
+/// Something to do, asked for by a shortcut or a menu item.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Command {
+    NewWindow,
+    NewTab,
+    Open,
+    Save,
+    SaveAs,
+    CloseTab,
+    Quit,
+    Settings,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    ToggleComment,
+    Format,
+    AddNextOccurrence,
+    SelectAllOccurrences,
+    SplitIntoLines,
+    AddCaretAbove,
+    AddCaretBelow,
+    Find,
+    FindReplace,
+    FindNext,
+    FindPrevious,
+    GoToLine,
+    ToggleCase,
+    ToggleRegex,
+    ToggleWholeWord,
+    WordWrap,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    NextTab,
+    PreviousTab,
+    Tab(usize),
+}
+
+/// What the menu bar shows as ticked for the focused window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MenuState {
+    pub word_wrap: bool,
+    pub find: FindOptions,
 }
 
 #[derive(Clone, Copy)]
@@ -419,6 +468,10 @@ impl Win {
         self.tabs.iter().any(|t| t.editor.doc.is_dirty())
     }
 
+    pub fn menu_state(&self) -> MenuState {
+        MenuState { word_wrap: self.tab().wrap, find: self.find_options }
+    }
+
     pub fn notify(&mut self, message: &str) {
         self.message = Some((message.to_string(), Instant::now()));
         self.window.request_redraw();
@@ -750,9 +803,22 @@ impl Win {
 
     /// Window-level shortcuts. `None` means the key was not a shortcut.
     fn shortcut(&mut self, fonts: &mut Fonts, event: &KeyEvent, mods: ModifiersState) -> Option<Action> {
-        let (shift, ctrl, alt) = (mods.shift_key(), mods.control_key(), mods.alt_key());
+        if let Some(command) = self.command_for(event, mods) {
+            return Some(self.run(fonts, command));
+        }
+        // Swallow other shortcuts on letters so they never type one. Named keys such as
+        // Cmd+Left go on to the editor.
+        let primary = if MAC { mods.super_key() } else { mods.control_key() && !mods.alt_key() };
+        let character = matches!(event.key_without_modifiers(), Key::Character(_));
+        (primary && character).then_some(Action::None)
+    }
+
+    /// The command a key press asks for, if it is a shortcut.
+    fn command_for(&self, event: &KeyEvent, mods: ModifiersState) -> Option<Command> {
+        let (shift, ctrl, alt, cmd) =
+            (mods.shift_key(), mods.control_key(), mods.alt_key(), mods.super_key());
         // Ctrl+Alt is AltGr on Windows and Linux layouts, which types characters.
-        let primary = if MAC { mods.super_key() } else { ctrl && !alt };
+        let primary = if MAC { cmd } else { ctrl && !alt };
         let named = match &event.logical_key {
             Key::Named(n) => Some(*n),
             _ => None,
@@ -764,121 +830,160 @@ impl Win {
         };
 
         // Add a caret above or below: Ctrl+Shift+Up/Down on macOS, Ctrl+Alt+Up/Down elsewhere.
-        let add_caret = if MAC { ctrl && shift && !mods.super_key() } else { ctrl && alt };
-        if add_caret && matches!(named, Some(NamedKey::ArrowUp | NamedKey::ArrowDown)) {
-            self.add_caret_vertically(fonts, named == Some(NamedKey::ArrowDown));
-            self.after_command(fonts);
-            return Some(Action::None);
-        }
-        // Select every occurrence: Ctrl+Cmd+G on macOS, Alt+F3 elsewhere.
-        if (MAC && ctrl && mods.super_key() && ch == "g") || (!MAC && alt && named == Some(NamedKey::F3)) {
-            self.ed().select_all_occurrences();
-            self.after_command(fonts);
-            return Some(Action::None);
-        }
+        let add_caret = if MAC { ctrl && shift && !cmd } else { ctrl && alt };
         match named {
+            Some(NamedKey::ArrowUp) if add_caret => return Some(Command::AddCaretAbove),
+            Some(NamedKey::ArrowDown) if add_caret => return Some(Command::AddCaretBelow),
+            Some(NamedKey::F3) if !MAC && alt => return Some(Command::SelectAllOccurrences),
+            Some(NamedKey::F3) => return Some(if shift { Command::FindPrevious } else { Command::FindNext }),
             Some(NamedKey::Tab) if ctrl => {
-                let n = self.tabs.len();
-                self.switch_tab(if shift { (self.active + n - 1) % n } else { (self.active + 1) % n });
-                return Some(Action::None);
+                return Some(if shift { Command::PreviousTab } else { Command::NextTab })
             }
-            Some(NamedKey::PageDown | NamedKey::PageUp) if ctrl && !MAC => {
-                let n = self.tabs.len();
-                let forward = named == Some(NamedKey::PageDown);
-                self.switch_tab(if forward { (self.active + 1) % n } else { (self.active + n - 1) % n });
-                return Some(Action::None);
-            }
-            Some(NamedKey::F3) => {
-                self.find_next(fonts, shift);
-                return Some(Action::None);
-            }
+            Some(NamedKey::PageDown) if ctrl && !MAC => return Some(Command::NextTab),
+            Some(NamedKey::PageUp) if ctrl && !MAC => return Some(Command::PreviousTab),
             _ => {}
         }
+        if MAC && ctrl && cmd && ch == "g" {
+            return Some(Command::SelectAllOccurrences);
+        }
         if ctrl && !alt && ch == "g" {
-            self.open_goto();
-            return Some(Action::None);
+            return Some(Command::GoToLine);
         }
         if !MAC && ctrl && !alt && ch == "h" {
-            self.open_find(true);
-            return Some(Action::None);
+            return Some(Command::FindReplace);
         }
-        if shift && alt && !ctrl && !mods.super_key() && ch == "f" {
-            self.format(false);
-            return Some(Action::None);
+        if shift && alt && !ctrl && !cmd && ch == "f" {
+            return Some(Command::Format);
         }
-        if alt && !ctrl && !mods.super_key() && ch == "z" {
-            let tab = self.tab_mut();
-            tab.wrap = !tab.wrap;
-            tab.scroll_x = 0.0;
-            let wrap = tab.wrap;
-            self.notify(if wrap { "Word wrap on" } else { "Word wrap off" });
-            self.after_command(fonts);
-            return Some(Action::None);
+        if alt && !ctrl && !cmd && ch == "z" {
+            return Some(Command::WordWrap);
         }
         let toggle_mods = if MAC { primary && alt } else { alt && !ctrl };
         if toggle_mods && matches!(self.panel, Some(Panel::Find { .. })) {
-            let toggle = match ch.as_str() {
-                "c" => Some(Toggle::Case),
-                "r" => Some(Toggle::Regex),
-                "w" => Some(Toggle::Word),
-                _ => None,
-            };
-            if let Some(toggle) = toggle {
-                self.toggle(fonts, toggle);
-                return Some(Action::None);
+            match ch.as_str() {
+                "c" => return Some(Command::ToggleCase),
+                "r" => return Some(Command::ToggleRegex),
+                "w" => return Some(Command::ToggleWholeWord),
+                _ => {}
             }
         }
         if !primary {
             return None;
         }
-        match ch.as_str() {
-            "s" if shift => self.save_as(),
-            "s" => self.save(),
-            "z" if shift => self.ed().redo(),
-            "z" => self.ed().undo(),
-            "y" if !MAC => self.ed().redo(),
-            "a" => match self.focused_input() {
+        Some(match ch.as_str() {
+            "s" if shift => Command::SaveAs,
+            "s" => Command::Save,
+            "z" if shift => Command::Redo,
+            "z" => Command::Undo,
+            "y" if !MAC => Command::Redo,
+            "a" => Command::SelectAll,
+            "c" => Command::Copy,
+            "x" => Command::Cut,
+            "v" => Command::Paste,
+            "w" => Command::CloseTab,
+            "q" if MAC => Command::Quit,
+            "n" if shift => Command::NewWindow,
+            "n" => Command::NewTab,
+            "o" => Command::Open,
+            "f" if MAC && alt => Command::FindReplace,
+            "f" => Command::Find,
+            "d" => Command::AddNextOccurrence,
+            "l" if shift => Command::SplitIntoLines,
+            "/" => Command::ToggleComment,
+            "," => Command::Settings,
+            "g" if MAC && shift => Command::FindPrevious,
+            "g" if MAC => Command::FindNext,
+            "]" if MAC && shift => Command::NextTab,
+            "[" if MAC && shift => Command::PreviousTab,
+            "=" | "+" => Command::ZoomIn,
+            "-" => Command::ZoomOut,
+            "0" => Command::ZoomReset,
+            d if d.len() == 1 && ("1"..="9").contains(&d) => Command::Tab(d.parse::<usize>().unwrap() - 1),
+            _ => return None,
+        })
+    }
+
+    /// Carries out `command`, from a shortcut or the menu bar.
+    pub fn run(&mut self, fonts: &mut Fonts, command: Command) -> Action {
+        self.blink_start = Instant::now();
+        let n = self.tabs.len();
+        match command {
+            Command::NewWindow => return Action::NewWindow,
+            Command::NewTab => {
+                self.add_tab(Document::empty(None).into());
+            }
+            Command::Open => self.open_dialog(),
+            Command::Save => self.save(),
+            Command::SaveAs => self.save_as(),
+            Command::CloseTab => return self.close_tab(self.active),
+            Command::Quit => return Action::Quit,
+            Command::Settings => self.open_settings(),
+            Command::Undo => self.ed().undo(),
+            Command::Redo => self.ed().redo(),
+            Command::Cut => {
+                let text = self.ed().cut();
+                self.after_command(fonts);
+                return Action::Copy(text);
+            }
+            Command::Copy => return Action::Copy(self.tab().editor.copy()),
+            Command::Paste => return Action::Paste,
+            Command::SelectAll => match self.focused_input() {
                 Some(input) => input.select_all(),
                 None => self.ed().select_all(),
             },
-            "c" => return Some(Action::Copy(self.tab().editor.copy())),
-            "x" => {
-                let text = self.ed().cut();
-                self.after_command(fonts);
-                return Some(Action::Copy(text));
-            }
-            "v" => return Some(Action::Paste),
-            "w" => return Some(self.close_tab(self.active)),
-            "q" if MAC => return Some(Action::Quit),
-            "n" => {
-                self.add_tab(Document::empty(None).into());
-            }
-            "o" => self.open_dialog(),
-            "f" => self.open_find(MAC && alt),
-            "d" => {
+            Command::ToggleComment => match editor::comment_style(&self.tab().syntax_name) {
+                Some(style) => self.ed().toggle_comment(style),
+                None => self.notify("No comment style for this file type"),
+            },
+            Command::Format => self.format(false),
+            Command::AddNextOccurrence => {
                 if !self.ed().add_next_occurrence() {
                     self.notify("No more occurrences");
                 }
             }
-            "l" if shift => self.ed().split_into_lines(),
-            "/" => match editor::comment_style(&self.tab().syntax_name) {
-                Some(style) => self.ed().toggle_comment(style),
-                None => self.notify("No comment style for this file type"),
-            },
-            "," => self.open_settings(),
-            "g" if MAC => self.find_next(fonts, shift),
-            "]" if MAC && shift => self.switch_tab((self.active + 1) % self.tabs.len()),
-            "[" if MAC && shift => self.switch_tab((self.active + self.tabs.len() - 1) % self.tabs.len()),
-            "=" | "+" => self.zoom(fonts, 1.0),
-            "-" => self.zoom(fonts, -1.0),
-            "0" => self.zoom(fonts, self.settings.font_size - self.font_points),
-            d if d.len() == 1 && ("1"..="9").contains(&d) => self.switch_tab(d.parse::<usize>().unwrap() - 1),
-            // Swallow other shortcuts so they never type a letter.
-            _ => return Some(Action::None),
+            Command::SelectAllOccurrences => self.ed().select_all_occurrences(),
+            Command::SplitIntoLines => self.ed().split_into_lines(),
+            Command::AddCaretAbove | Command::AddCaretBelow => {
+                // Keeps the goal columns, so the new carets line up.
+                self.add_caret_vertically(fonts, command == Command::AddCaretBelow);
+                self.after_command(fonts);
+                return Action::None;
+            }
+            Command::Find => self.open_find(false),
+            Command::FindReplace => self.open_find(true),
+            Command::FindNext => self.find_next(fonts, false),
+            Command::FindPrevious => self.find_next(fonts, true),
+            Command::GoToLine => self.open_goto(),
+            Command::ToggleCase => self.toggle(fonts, Toggle::Case),
+            Command::ToggleRegex => self.toggle(fonts, Toggle::Regex),
+            Command::ToggleWholeWord => self.toggle(fonts, Toggle::Word),
+            Command::WordWrap => {
+                let tab = self.tab_mut();
+                tab.wrap = !tab.wrap;
+                tab.scroll_x = 0.0;
+                let wrap = tab.wrap;
+                self.notify(if wrap { "Word wrap on" } else { "Word wrap off" });
+            }
+            Command::ZoomIn => self.zoom(fonts, 1.0),
+            Command::ZoomOut => self.zoom(fonts, -1.0),
+            Command::ZoomReset => self.zoom(fonts, self.settings.font_size - self.font_points),
+            // Switching tabs keeps each tab's scroll position, so return before revealing the caret.
+            Command::NextTab => {
+                self.switch_tab((self.active + 1) % n);
+                return Action::None;
+            }
+            Command::PreviousTab => {
+                self.switch_tab((self.active + n - 1) % n);
+                return Action::None;
+            }
+            Command::Tab(i) => {
+                self.switch_tab(i);
+                return Action::None;
+            }
         }
         self.tab_mut().goals.clear();
         self.after_command(fonts);
-        Some(Action::None)
+        Action::None
     }
 
     fn editor_key(&mut self, fonts: &mut Fonts, event: &KeyEvent, mods: ModifiersState) -> Action {

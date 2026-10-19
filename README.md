@@ -37,12 +37,13 @@ and every push is built and tested on macOS, Windows, and Linux.
 
 ## Keys
 
-`Cmd` on macOS, `Ctrl` elsewhere.
+`Cmd` on macOS, `Ctrl` elsewhere. On macOS the same commands are in the menu bar.
 
 | Keys | Action |
 | --- | --- |
 | `Cmd+S` / `Cmd+Shift+S` | Save / save as (atomic; follows symlinks; keeps line endings) |
 | `Cmd+N` / `Cmd+O` | New tab / open files (or drop files on the window) |
+| `Cmd+Shift+N` | New window |
 | `Cmd+W` | Close tab (press twice to discard unsaved changes) |
 | `Cmd+Q` | Quit, keeping unsaved work for next time |
 | `Ctrl+Tab`, `Cmd+1`…`9` | Next tab / jump to tab (`Cmd+Shift+[`/`]` on macOS, `Ctrl+PageUp`/`PageDown` elsewhere) |
@@ -147,7 +148,8 @@ Startup: after the first launch, oxide loads only the font files it used last ti
 (`fonts.json` in its data folder) and scans the rest in the background, so a cold start
 doesn't wait on the whole font library.
 
-Known limits today: lines over 16 KB aren't highlighted.
+Known limits today: lines over 16 KB aren't highlighted; Windows and Linux have no menu
+bar yet (every command has a shortcut).
 
 ## License
 
