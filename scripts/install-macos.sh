@@ -26,7 +26,14 @@ cp "$root/packaging/macos/ox" "$bundle/Contents/SharedSupport/bin/ox"
 cp "$root/packaging/macos/Oxide.icns" "$bundle/Contents/Resources/Oxide.icns"
 sed "s/__VERSION__/$version/g" "$root/packaging/macos/Info.plist" > "$bundle/Contents/Info.plist"
 # An ad-hoc signature is enough for a locally built app to launch on Apple silicon.
-codesign --force --sign - "$bundle"
+# OXIDE_SIGN_IDENTITY names a Developer ID certificate instead (CI does this for
+# releases); notarization also needs the hardened runtime and a secure timestamp.
+identity=${OXIDE_SIGN_IDENTITY:--}
+if [ "$identity" = "-" ]; then
+    codesign --force --sign - "$bundle"
+else
+    codesign --force --options runtime --timestamp --sign "$identity" "$bundle"
+fi
 
 if [ "${1:-}" = "--bundle-only" ]; then
     echo "Built $bundle"

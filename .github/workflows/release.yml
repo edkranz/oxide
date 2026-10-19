@@ -41,10 +41,55 @@ jobs:
           mkdir -p target/release
           lipo -create -output target/release/oxide \
             target/aarch64-apple-darwin/release/oxide target/x86_64-apple-darwin/release/oxide
+      # With the Developer ID secrets set, the app is signed and notarized so Gatekeeper
+      # opens it without a warning; without them it gets an ad-hoc signature.
+      - name: Import the Developer ID certificate
+        id: sign
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$CERTIFICATE" ]; then
+            echo "No MACOS_CERTIFICATE secret; signing ad hoc"
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 16)
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')
+          [ -n "$identity" ] || { echo "MACOS_CERTIFICATE has no Developer ID Application identity" >&2; exit 1; }
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
       - name: Bundle
+        env:
+          OXIDE_SIGN_IDENTITY: ${{ steps.sign.outputs.identity }}
         run: |
           OXIDE_SKIP_BUILD=1 scripts/install-macos.sh --bundle-only
+          codesign --verify --strict --verbose=2 target/release/Oxide.app
           mkdir -p dist
+          ditto -c -k --keepParent target/release/Oxide.app dist/Oxide-macos-universal.zip
+      - name: Notarize
+        if: steps.sign.outputs.identity != '-'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          echo "$API_KEY" | base64 --decode > "$RUNNER_TEMP/api-key.p8"
+          xcrun notarytool submit dist/Oxide-macos-universal.zip --wait --timeout 30m \
+            --key "$RUNNER_TEMP/api-key.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER"
+          rm "$RUNNER_TEMP/api-key.p8"
+          # Staple the ticket so the app opens offline too, then zip the stapled app.
+          xcrun stapler staple target/release/Oxide.app
+          spctl --assess --type execute --verbose target/release/Oxide.app
+          rm dist/Oxide-macos-universal.zip
           ditto -c -k --keepParent target/release/Oxide.app dist/Oxide-macos-universal.zip
       - uses: actions/upload-artifact@v4
         with:
