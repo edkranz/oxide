@@ -162,6 +162,35 @@ impl Document {
         vec![change]
     }
 
+    /// Applies non-overlapping `(start, end, text)` edits (char ranges in the current
+    /// text) as a single undo step.
+    pub fn replace_many(
+        &mut self,
+        mut edits: Vec<(usize, usize, String)>,
+        before: Selection,
+        after: Selection,
+    ) -> Vec<Change> {
+        // Back to front, so earlier ranges stay valid as later ones change length.
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+        let mut changes = Vec::new();
+        let mut recorded = Vec::new();
+        for (start, end, text) in edits {
+            let removed: String = self.text.slice(start..end).into();
+            changes.push(self.splice(start, end - start, &text));
+            recorded.push(Edit { at: start, removed, inserted: text });
+        }
+        if recorded.is_empty() {
+            return changes;
+        }
+        self.redo.clear();
+        let id = self.next_id;
+        self.next_id += 1;
+        let tx =
+            Transaction { id, kind: EditKind::Other, edits: recorded, before, after, time: Instant::now() };
+        self.undo.push(tx);
+        changes
+    }
+
     pub fn undo(&mut self) -> Option<(Selection, Vec<Change>)> {
         let tx = self.undo.pop()?;
         let mut changes = Vec::new();
@@ -241,13 +270,10 @@ impl Document {
 fn continues(prev: &Edit, next: &Edit, kind: EditKind) -> bool {
     match kind {
         EditKind::Insert => {
-            !next.inserted.contains('\n')
-                && next.at == prev.at + prev.inserted.chars().count()
+            !next.inserted.contains('\n') && next.at == prev.at + prev.inserted.chars().count()
         }
         // Backspace walks left; forward-delete stays put.
-        EditKind::Delete => {
-            next.at + next.removed.chars().count() == prev.at || next.at == prev.at
-        }
+        EditKind::Delete => next.at + next.removed.chars().count() == prev.at || next.at == prev.at,
         EditKind::Other => false,
     }
 }
@@ -264,7 +290,14 @@ mod tests {
     fn type_chars(doc: &mut Document, at: usize, text: &str) {
         for (i, c) in text.chars().enumerate() {
             let pos = at + i;
-            doc.replace(pos, pos, &c.to_string(), Selection::caret(pos), Selection::caret(pos + 1), EditKind::Insert);
+            doc.replace(
+                pos,
+                pos,
+                &c.to_string(),
+                Selection::caret(pos),
+                Selection::caret(pos + 1),
+                EditKind::Insert,
+            );
         }
     }
 
@@ -353,13 +386,27 @@ mod tests {
     }
 
     #[test]
+    fn replace_many_is_one_undo_step() {
+        let mut doc = Document::empty(None);
+        doc.text = Rope::from_str("a-b-c");
+        let edits = vec![(1, 2, "+".into()), (3, 4, "++".into())];
+        doc.replace_many(edits, Selection::caret(0), Selection::caret(0));
+        assert_eq!(doc.text.to_string(), "a+b++c");
+        doc.undo();
+        assert_eq!(doc.text.to_string(), "a-b-c");
+        doc.redo();
+        assert_eq!(doc.text.to_string(), "a+b++c");
+    }
+
+    #[test]
     fn changes_report_replaced_line_ranges() {
         let mut doc = Document::empty(None);
         doc.text = Rope::from_str("a\nb\nc\n");
         // Join lines 1 and 2 ("b\nc" -> "bc").
         let change = doc.replace(3, 4, "", Selection::caret(3), Selection::caret(3), EditKind::Other)[0];
         assert_eq!((change.first_line, change.old_lines, change.new_lines), (1, 2, 1));
-        let change = doc.replace(0, 0, "x\ny\n", Selection::caret(0), Selection::caret(4), EditKind::Other)[0];
+        let change =
+            doc.replace(0, 0, "x\ny\n", Selection::caret(0), Selection::caret(4), EditKind::Other)[0];
         assert_eq!((change.first_line, change.old_lines, change.new_lines), (0, 1, 3));
     }
 }

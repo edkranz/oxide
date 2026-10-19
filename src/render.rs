@@ -3,8 +3,8 @@
 
 use crate::highlight::StyledRun;
 use cosmic_text::{
-    Attrs, AttrsList, Color, Family, FontSystem, Hinting, LayoutLine, ShapeLine, Shaping,
-    Style, SwashCache, SwashContent, Weight, Wrap,
+    Attrs, AttrsList, Color, Family, FontSystem, Hinting, LayoutLine, ShapeLine, Shaping, Style, SwashCache,
+    SwashContent, Weight, Wrap,
 };
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -31,9 +31,7 @@ impl Fonts {
         };
         let mono = candidates
             .iter()
-            .find(|name| {
-                system.db().faces().any(|f| f.families.iter().any(|(family, _)| family == *name))
-            })
+            .find(|name| system.db().faces().any(|f| f.families.iter().any(|(family, _)| family == *name)))
             .map(|name| name.to_string());
         Self { system, swash: SwashCache::new(), mono }
     }
@@ -198,16 +196,16 @@ impl Canvas<'_> {
         }
     }
 
+    /// A rectangle outline `thickness` pixels wide, inside the given bounds.
+    pub fn outline(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: u32) {
+        self.fill(x0, y0, x1, y0 + thickness, color);
+        self.fill(x0, y1 - thickness, x1, y1, color);
+        self.fill(x0, y0, x0 + thickness, y1, color);
+        self.fill(x1 - thickness, y0, x1, y1, color);
+    }
+
     /// Draws `line` with its left edge at `x` and baseline at `y`, clipped to `clip_x0..clip_x1`.
-    pub fn text(
-        &mut self,
-        fonts: &mut Fonts,
-        line: &LayoutLine,
-        x: f32,
-        y: f32,
-        clip_x0: f32,
-        clip_x1: f32,
-    ) {
+    pub fn text(&mut self, fonts: &mut Fonts, line: &LayoutLine, x: f32, y: f32, clip_x0: f32, clip_x1: f32) {
         for glyph in &line.glyphs {
             if x + glyph.x + glyph.w < clip_x0 {
                 continue;
@@ -215,9 +213,9 @@ impl Canvas<'_> {
             if x + glyph.x > clip_x1 {
                 break;
             }
-            let color = glyph.color_opt.map_or(0xffffff, |c| {
-                (c.r() as u32) << 16 | (c.g() as u32) << 8 | c.b() as u32
-            });
+            let color = glyph
+                .color_opt
+                .map_or(0xffffff, |c| (c.r() as u32) << 16 | (c.g() as u32) << 8 | c.b() as u32);
             let physical = glyph.physical((x, y), 1.0);
             let Some(image) = fonts.swash.get_image(&mut fonts.system, physical.cache_key) else {
                 continue;

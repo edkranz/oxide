@@ -1,12 +1,14 @@
 mod document;
 mod editor;
+mod find;
 mod highlight;
+mod input;
 mod render;
 mod window;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use syntect::highlighting::{Theme, ThemeSet};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -17,14 +19,12 @@ use winit::window::WindowId;
 use crate::document::Document;
 use crate::highlight::Batch;
 use crate::render::Fonts;
-use crate::window::{Action, Palette, Win};
-
-/// A second close or quit within this window discards unsaved changes.
-const CONFIRM_WINDOW: Duration = Duration::from_secs(4);
+use crate::window::{Action, Palette, Win, CONFIRM_WINDOW};
 const THEME: &str = "base16-ocean.dark";
 
 pub enum UserEvent {
-    Highlighted(WindowId, Batch),
+    /// Colours for one tab: window, tab id, and the batch.
+    Highlighted(WindowId, u64, Batch),
 }
 /// This is a comment. And yeah in oxide it is super fast and nice ! Let's gooooo
 /// `~/.config/oxide` (or `%APPDATA%\oxide`): where add-ons such as syntaxes live.
@@ -62,15 +62,15 @@ struct App {
 }
 
 impl App {
-    fn open_window(&mut self, event_loop: &ActiveEventLoop, path: Option<PathBuf>) {
-        let doc = match path.clone().map(Document::open) {
-            None => Document::empty(None),
-            Some(Ok(doc)) => doc,
-            Some(Err(e)) => {
-                eprintln!("oxide: {}: {e}", path.unwrap().display());
-                return;
+    /// Opens one window with a tab per path (or an empty tab).
+    fn open_window(&mut self, event_loop: &ActiveEventLoop, paths: Vec<PathBuf>) {
+        let mut docs = Vec::new();
+        for path in paths {
+            match Document::open(path.clone()) {
+                Ok(doc) => docs.push(doc),
+                Err(e) => eprintln!("oxide: {}: {e}", path.display()),
             }
-        };
+        }
         let fonts = self.fonts.get_or_insert_with(|| {
             let fonts = Fonts::new();
             trace("fonts loaded");
@@ -82,7 +82,7 @@ impl App {
             let palette = Palette::from_theme(&theme);
             (theme, palette)
         });
-        match Win::new(event_loop, fonts, doc, theme.clone(), *palette, self.proxy.clone()) {
+        match Win::new(event_loop, fonts, docs, theme.clone(), *palette, self.proxy.clone()) {
             Ok(win) => {
                 self.windows.insert(win.id(), win);
             }
@@ -118,12 +118,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let paths = std::mem::take(&mut self.paths);
-        if paths.is_empty() {
-            self.open_window(event_loop, None);
-        }
-        for path in paths {
-            self.open_window(event_loop, Some(path));
-        }
+        self.open_window(event_loop, paths);
         if self.windows.is_empty() {
             event_loop.exit();
         }
@@ -131,9 +126,9 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Highlighted(id, batch) => {
+            UserEvent::Highlighted(id, tab, batch) => {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    win.apply_highlights(batch);
+                    win.apply_highlights(tab, batch);
                 }
             }
         }
@@ -157,7 +152,7 @@ impl ApplicationHandler<UserEvent> for App {
         match action {
             Action::None => {}
             Action::Close => {
-                if win.confirm_close(CONFIRM_WINDOW) {
+                if win.confirm_close() {
                     self.windows.remove(&id);
                     if self.windows.is_empty() {
                         event_loop.exit();

@@ -133,8 +133,7 @@ pub fn syntax_set() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
     SET.get_or_init(|| {
         let defaults = SyntaxSet::load_defaults_newlines();
-        let Some(dir) = crate::config_dir().map(|d| d.join("syntaxes")).filter(|d| d.is_dir())
-        else {
+        let Some(dir) = crate::config_dir().map(|d| d.join("syntaxes")).filter(|d| d.is_dir()) else {
             return defaults;
         };
         let mut builder = defaults.into_builder();
@@ -291,7 +290,10 @@ impl<F: Fn(Batch)> Worker<F> {
                             italic: style.font_style.contains(FontStyle::ITALIC),
                         };
                         match runs.last_mut() {
-                            Some(last) if (last.color, last.bold, last.italic) == (run.color, run.bold, run.italic) => {
+                            Some(last)
+                                if (last.color, last.bold, last.italic)
+                                    == (run.color, run.bold, run.italic) =>
+                            {
                                 last.len += run.len
                             }
                             _ => runs.push(run),

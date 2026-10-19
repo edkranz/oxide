@@ -62,7 +62,11 @@ impl Editor {
             return text.len_chars();
         }
         let next = text.line_to_char(line + 1);
-        if next >= 2 && text.char(next - 2) == '\r' { next - 2 } else { next - 1 }
+        if next >= 2 && text.char(next - 2) == '\r' {
+            next - 2
+        } else {
+            next - 1
+        }
     }
 
     /// The line's text without its line break.
@@ -162,20 +166,13 @@ impl Editor {
     }
 
     pub fn move_left(&mut self, extend: bool) {
-        let pos = if !extend && !self.sel.is_empty() {
-            self.sel.start()
-        } else {
-            self.prev_pos(self.sel.head)
-        };
+        let pos =
+            if !extend && !self.sel.is_empty() { self.sel.start() } else { self.prev_pos(self.sel.head) };
         self.move_to(pos, extend);
     }
 
     pub fn move_right(&mut self, extend: bool) {
-        let pos = if !extend && !self.sel.is_empty() {
-            self.sel.end()
-        } else {
-            self.next_pos(self.sel.head)
-        };
+        let pos = if !extend && !self.sel.is_empty() { self.sel.end() } else { self.next_pos(self.sel.head) };
         self.move_to(pos, extend);
     }
 
@@ -240,12 +237,25 @@ impl Editor {
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        let kind = if text.chars().count() == 1 && text != "\n" {
-            EditKind::Insert
-        } else {
-            EditKind::Other
-        };
+        let kind = if text.chars().count() == 1 && text != "\n" { EditKind::Insert } else { EditKind::Other };
         self.replace(self.sel.start(), self.sel.end(), text, kind);
+    }
+
+    /// Replaces the selection as its own undo step (find-and-replace, not typing).
+    pub fn replace_selection(&mut self, text: &str) {
+        self.replace(self.sel.start(), self.sel.end(), text, EditKind::Other);
+    }
+
+    /// Applies `(start, end, text)` char-range edits as one undo step.
+    pub fn replace_many(&mut self, edits: Vec<(usize, usize, String)>) {
+        if self.doc.read_only || edits.is_empty() {
+            return;
+        }
+        let before = self.sel;
+        let changes = self.doc.replace_many(edits, before, before);
+        self.changes.extend(changes);
+        let len = self.len();
+        self.sel = Selection::caret(before.head.min(len));
     }
 
     /// Pastes clipboard text, converting its line endings to the document's.
@@ -257,8 +267,7 @@ impl Editor {
 
     pub fn newline(&mut self) {
         let line = self.doc.text.char_to_line(self.sel.start());
-        let indent: String =
-            self.line_text(line).chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let indent: String = self.line_text(line).chars().take_while(|c| *c == ' ' || *c == '\t').collect();
         let text = format!("{}{}", self.doc.line_ending, indent);
         self.replace(self.sel.start(), self.sel.end(), &text, EditKind::Other);
     }
@@ -418,10 +427,7 @@ fn detect_indent(doc: &Document) -> Indent {
         return Indent::Spaces(4);
     }
     // The widest width that most indented lines are a multiple of.
-    let width = [8, 4, 3, 2]
-        .into_iter()
-        .find(|&w| widths[w] * 10 >= spaces * 9)
-        .unwrap_or(4);
+    let width = [8, 4, 3, 2].into_iter().find(|&w| widths[w] * 10 >= spaces * 9).unwrap_or(4);
     Indent::Spaces(width)
 }
 
