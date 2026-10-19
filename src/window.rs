@@ -652,7 +652,7 @@ impl Win {
         let elapsed = self.blink_start.elapsed();
         !self.settings.caret_blink
             || elapsed >= BLINK_IDLE
-            || (elapsed.as_millis() / BLINK.as_millis()) % 2 == 0
+            || (elapsed.as_millis() / BLINK.as_millis()).is_multiple_of(2)
     }
 
     /// When the caret next turns on or off, if it is blinking.

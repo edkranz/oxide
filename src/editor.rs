@@ -944,7 +944,7 @@ fn detect_indent(doc: &Document) -> Option<Indent> {
                 spaces += 1;
                 let n = line.chars().take_while(|c| *c == ' ').count();
                 for (w, count) in widths.iter_mut().enumerate().skip(2) {
-                    if n % w == 0 {
+                    if n.is_multiple_of(w) {
                         *count += 1;
                     }
                 }

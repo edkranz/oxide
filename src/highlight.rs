@@ -402,7 +402,7 @@ fn main() {
             seed ^= seed << 17;
             (seed % n as u64) as usize
         };
-        for step in 0..300 {
+        for step in 0..300usize {
             let len = doc.text.len_chars();
             let at = next(len + 1);
             let changes = if next(3) == 0 {
@@ -424,7 +424,7 @@ fn main() {
             };
             cache.record(doc.version, &changes);
             highlighter.edit(doc.version, doc.text.clone(), changes);
-            if step % 7 == 0 {
+            if step.is_multiple_of(7) {
                 while let Ok(batch) = rx.try_recv() {
                     cache.apply(batch);
                 }
