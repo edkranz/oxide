@@ -51,6 +51,8 @@ Run the script again to update.
 | `Alt+←/→` (`Ctrl` elsewhere) | Move by word; add `Shift` to select |
 | `Cmd+←/→`, `Home`/`End` | Line start (smart: indentation first) / end |
 | `Cmd+=` / `Cmd+-` / `Cmd+0` | Zoom in / out / reset |
+| `Shift+Alt+F` | Format the file with its formatter add-on |
+| `Cmd+,` | Open settings |
 
 Double-click selects a word, triple-click a line. Middle-click a tab to close it.
 Input methods (Chinese, Japanese, Korean, accented characters) are supported.
@@ -76,7 +78,36 @@ thread that handles typing.
 - **`window.rs`**: tabs, the find and go-to bar, input, scrolling, and painting a frame. Nothing redraws unless something
   changed, so an idle window uses no CPU.
 
-Add-ons: drop syntax definitions (`.sublime-syntax` YAML grammars) into `~/.config/oxide/syntaxes/`
+## Settings and formatters
+
+`Cmd+,` opens `~/.config/oxide/settings.toml` (`%APPDATA%\oxide\settings.toml` on Windows),
+created with every option commented. Saving it applies the changes immediately.
+
+```toml
+font_family = "JetBrains Mono"
+font_size = 14
+theme = "base16-ocean.dark"     # built in, or NAME.tmTheme in ~/.config/oxide/themes/
+tab_size = 4
+translate_tabs_to_spaces = true
+detect_indentation = true
+format_on_save = true
+
+# A formatter reads the file on stdin and prints the result; $FILE is the file's path.
+[[formatter]]
+extensions = ["rs"]
+command = ["rustfmt", "--edition", "2021", "--emit", "stdout"]
+
+[[formatter]]
+extensions = ["js", "ts", "json", "css", "md"]
+command = ["prettier", "--stdin-filepath", "$FILE"]
+```
+
+Formatting runs in the background, applies only the lines that changed as one undo step,
+and keeps your caret where it was. If a formatter fails, the file still saves.
+
+## Add-ons
+
+Drop syntax definitions (`.sublime-syntax` YAML grammars) into `~/.config/oxide/syntaxes/`
 (`%APPDATA%\oxide\syntaxes\` on Windows) to add languages.
 
 Debugging: `OXIDE_TRACE=1` prints startup timings; `OXIDE_SNAPSHOT=frame.bmp` writes every
@@ -90,9 +121,8 @@ frame to an image.
    and opens a tab in milliseconds. Hot exit, so unsaved buffers survive quitting.~~ Done.
 3. **Feel**: multiple cursors, auto-closing brackets, comment toggling, a minimap,
    colour schemes, settings file.
-4. **Add-ons**: declarative add-ons (formatter = "pipe the buffer through `rustfmt`",
-   themes, keymaps), then sandboxed WASM add-ons for anything needing code. A public
-   registry later.
+4. **Add-ons**: ~~declarative formatters, themes, and syntaxes~~ (done); keymaps; then
+   sandboxed WASM add-ons for anything needing code. A public registry later.
 5. **LSP as an add-on**, not core. The core will expose popups, underlines, and
    UTF-16 positions so it can be added without a rewrite.
 

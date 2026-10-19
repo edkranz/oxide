@@ -3,11 +3,13 @@
 use crate::document::{Document, Selection};
 use crate::editor::{Editor, Indent};
 use crate::find::{self, FindOptions, Search, MATCH_LIMIT};
+use crate::format;
 use crate::highlight::{Batch, Highlighter, StyleCache};
 use crate::input::LineInput;
 use crate::instance::Waiter;
 use crate::render::{blend, byte_for_x, x_for_byte, Canvas, Fonts, TextLayout};
 use crate::session::{TabSnapshot, WindowSnapshot};
+use crate::settings::{self, Settings};
 use crate::UserEvent;
 use cosmic_text::LayoutLine;
 use std::error::Error;
@@ -25,7 +27,6 @@ use winit::window::{Window, WindowId};
 
 /// A second close or quit within this window discards unsaved changes.
 pub const CONFIRM_WINDOW: Duration = Duration::from_secs(4);
-const FONT_POINTS: f32 = 14.0;
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 const MESSAGE_TIME: Duration = Duration::from_secs(4);
 const MAC: bool = cfg!(target_os = "macos");
@@ -193,6 +194,9 @@ pub struct Win {
     waiters: Vec<(Vec<u64>, Waiter)>,
     /// Set when something the session records has changed since it was last taken.
     session_changed: bool,
+    settings: Rc<Settings>,
+    /// Set when the settings file was saved from this window, so the app reloads it.
+    settings_saved: bool,
 }
 
 impl Win {
@@ -201,8 +205,8 @@ impl Win {
         fonts: &mut Fonts,
         tabs: Vec<TabInit>,
         active: usize,
-        theme: Theme,
-        palette: Palette,
+        settings: Rc<Settings>,
+        (theme, palette): (Theme, Palette),
         proxy: EventLoopProxy<UserEvent>,
     ) -> Result<Self, Box<dyn Error>> {
         let attrs = Window::default_attributes()
@@ -213,7 +217,9 @@ impl Win {
         window.set_ime_allowed(true);
         let context = softbuffer::Context::new(window.clone())?;
         let surface = softbuffer::Surface::new(&context, window.clone())?;
-        let layout = TextLayout::new(fonts, FONT_POINTS * window.scale_factor() as f32);
+        let font_points = settings.font_size;
+        let layout =
+            TextLayout::new(fonts, font_points * window.scale_factor() as f32, settings.tab_size as u16);
 
         let mut win = Self {
             window,
@@ -238,9 +244,11 @@ impl Win {
             last_click: None,
             message: None,
             close_armed: None,
-            font_points: FONT_POINTS,
+            font_points,
             waiters: Vec::new(),
             session_changed: false,
+            settings,
+            settings_saved: false,
         };
         for tab in tabs {
             win.add_tab(tab);
@@ -286,7 +294,11 @@ impl Win {
         if doc.read_only {
             self.notify("Not valid UTF-8: opened read-only");
         }
-        let mut editor = Editor::new(doc);
+        let default_indent = match self.settings.translate_tabs_to_spaces {
+            true => Indent::Spaces(self.settings.tab_size.max(1)),
+            false => Indent::Tabs,
+        };
+        let mut editor = Editor::new(doc, default_indent, self.settings.detect_indentation);
         editor.sel = sel;
         self.tabs.push(Tab {
             id,
@@ -645,6 +657,10 @@ impl Win {
             self.open_find(true);
             return Some(Action::None);
         }
+        if shift && alt && !ctrl && !mods.super_key() && ch == "f" {
+            self.format(false);
+            return Some(Action::None);
+        }
         let toggle_mods = if MAC { primary && alt } else { alt && !ctrl };
         if toggle_mods && matches!(self.panel, Some(Panel::Find { .. })) {
             let toggle = match ch.as_str() {
@@ -685,12 +701,13 @@ impl Win {
             }
             "o" => self.open_dialog(),
             "f" => self.open_find(MAC && alt),
+            "," => self.open_settings(),
             "g" if MAC => self.find_next(fonts, shift),
             "]" if MAC && shift => self.switch_tab((self.active + 1) % self.tabs.len()),
             "[" if MAC && shift => self.switch_tab((self.active + self.tabs.len() - 1) % self.tabs.len()),
             "=" | "+" => self.zoom(fonts, 1.0),
             "-" => self.zoom(fonts, -1.0),
-            "0" => self.zoom(fonts, FONT_POINTS - self.font_points),
+            "0" => self.zoom(fonts, self.settings.font_size - self.font_points),
             d if d.len() == 1 && ("1"..="9").contains(&d) => self.switch_tab(d.parse::<usize>().unwrap() - 1),
             // Swallow other shortcuts so they never type a letter.
             _ => return Some(Action::None),
@@ -1057,19 +1074,141 @@ impl Win {
         self.window.request_redraw();
     }
 
+    /// Saves the active tab, formatting it first when `format_on_save` is on.
     fn save(&mut self) {
-        if self.tab().editor.doc.path.is_none() {
-            return self.save_as();
+        let path = self.tab().editor.doc.path.clone();
+        match path {
+            None => self.save_as(),
+            Some(path) if self.settings.format_on_save && self.settings.formatter_for(&path).is_some() => {
+                self.format(true)
+            }
+            Some(_) => self.save_now(),
         }
+    }
+
+    fn save_now(&mut self) {
         match self.ed().doc.save() {
             Ok(()) => {
                 self.tab_mut().close_armed = None;
                 self.close_armed = None;
                 self.session_changed = true;
+                let path = self.tab().editor.doc.path.clone();
+                if path.is_some() && path == settings::path() {
+                    self.settings_saved = true;
+                }
                 self.notify("Saved");
             }
             Err(e) => self.notify(&format!("Save failed: {e}")),
         }
+    }
+
+    fn open_settings(&mut self) {
+        match settings::ensure_file() {
+            Ok(path) => {
+                self.open_paths(vec![path]);
+            }
+            Err(e) => self.notify(&format!("Could not create the settings file: {e}")),
+        }
+    }
+
+    /// Whether the settings file was saved here since the last call; clears the flag.
+    pub fn take_settings_saved(&mut self) -> bool {
+        std::mem::take(&mut self.settings_saved)
+    }
+
+    /// Applies reloaded settings: fonts, theme, and tab width. Indentation of open files
+    /// is left as it was detected.
+    pub fn apply_settings(
+        &mut self,
+        fonts: &mut Fonts,
+        settings: Rc<Settings>,
+        theme: Theme,
+        palette: Palette,
+    ) {
+        self.font_points = settings.font_size;
+        self.settings = settings;
+        self.palette = palette;
+        self.theme = theme;
+        let window_id = self.window.id();
+        for tab in &mut self.tabs {
+            let (proxy, id) = (self.proxy.clone(), tab.id);
+            tab.highlighter = Highlighter::spawn(self.theme.clone(), move |batch| {
+                let _ = proxy.send_event(UserEvent::Highlighted(window_id, id, batch));
+            });
+            let doc = &tab.editor.doc;
+            tab.highlighter.reset(doc.version, doc.text.clone(), doc.path.clone());
+            tab.styles = StyleCache::new(doc.text.len_lines());
+        }
+        self.rebuild_layout(fonts);
+    }
+
+    /// Runs the active tab's formatter on a background thread; `then_save` saves after.
+    fn format(&mut self, then_save: bool) {
+        let tab = self.tab();
+        let Some(path) = tab.editor.doc.path.clone() else {
+            return self.notify("Save the file first, so oxide knows which formatter to use");
+        };
+        let Some(formatter) = self.settings.formatter_for(&path).cloned() else {
+            if then_save {
+                return self.save_now();
+            }
+            let name = path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+            return self.notify(&format!("No formatter for {name}. Add one in settings ({PRIMARY}+,)"));
+        };
+        let (text, version, tab_id) = (tab.editor.doc.text.to_string(), tab.editor.doc.version, tab.id);
+        let (proxy, window) = (self.proxy.clone(), self.window.id());
+        self.notify(&format!("Formatting with {}…", formatter.command[0]));
+        std::thread::spawn(move || {
+            let result = format::run(&formatter.command, &text, Some(&path));
+            let _ =
+                proxy.send_event(UserEvent::Formatted { window, tab: tab_id, version, result, then_save });
+        });
+    }
+
+    /// Applies a formatter's output as one undo step, if the text hasn't changed since.
+    pub fn apply_format(
+        &mut self,
+        fonts: &mut Fonts,
+        tab_id: u64,
+        version: u64,
+        result: Result<String, String>,
+        then_save: bool,
+    ) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let previous = std::mem::replace(&mut self.active, index);
+        if self.tab().editor.doc.version != version {
+            self.notify("The file changed while it was being formatted; format again");
+        } else {
+            match result {
+                Ok(formatted) => {
+                    let ed = &self.tab().editor;
+                    if let Some(edit) = format::minimal_edit(&ed.doc.text.to_string(), &formatted) {
+                        // Keep the caret on the same line and column.
+                        let line = ed.caret_line();
+                        let column = ed.sel.head - ed.doc.text.line_to_char(line);
+                        self.ed().replace_many(vec![edit]);
+                        let ed = self.ed();
+                        let line = line.min(ed.doc.text.len_lines() - 1);
+                        let pos = (ed.doc.text.line_to_char(line) + column).min(ed.line_end(line));
+                        ed.sel = Selection::caret(pos);
+                        self.after_command(fonts);
+                    }
+                    if then_save {
+                        self.save_now();
+                    } else {
+                        self.notify("Formatted");
+                    }
+                }
+                Err(e) if then_save => {
+                    // A failing formatter must never stop a save.
+                    self.save_now();
+                    self.notify(&format!("Saved without formatting. {e}"));
+                }
+                Err(e) => self.notify(&format!("Format failed. {e}")),
+            }
+        }
+        self.active = if previous < self.tabs.len() { previous } else { index };
+        self.window.request_redraw();
     }
 
     fn save_as(&mut self) {
@@ -1080,7 +1219,7 @@ impl Win {
         }
         let Some(path) = dialog.save_file() else { return };
         self.ed().doc.path = Some(path);
-        self.save();
+        self.save_now();
         // The new name may mean a different language.
         let tab = self.tab_mut();
         let doc = &tab.editor.doc;
@@ -1105,7 +1244,8 @@ impl Win {
     }
 
     fn rebuild_layout(&mut self, fonts: &mut Fonts) {
-        self.layout = TextLayout::new(fonts, self.font_points * self.window.scale_factor() as f32);
+        let size = self.font_points * self.window.scale_factor() as f32;
+        self.layout = TextLayout::new(fonts, size, self.settings.tab_size as u16);
         self.window.request_redraw();
     }
 

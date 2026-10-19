@@ -1,6 +1,7 @@
 mod document;
 mod editor;
 mod find;
+mod format;
 mod highlight;
 mod input;
 mod instance;
@@ -8,12 +9,14 @@ mod instance;
 mod macos;
 mod render;
 mod session;
+mod settings;
 mod window;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::Theme;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -25,8 +28,8 @@ use crate::highlight::Batch;
 use crate::instance::Waiter;
 use crate::render::Fonts;
 use crate::session::TabState;
+use crate::settings::Settings;
 use crate::window::{Action, Palette, TabInit, Win, CONFIRM_WINDOW};
-const THEME: &str = "base16-ocean.dark";
 /// How long after a change the session is saved, so bursts of typing share one write.
 const SESSION_DELAY: Duration = Duration::from_secs(2);
 
@@ -35,6 +38,8 @@ pub enum UserEvent {
     Highlighted(WindowId, u64, Batch),
     /// Files from another `ox` invocation, Finder, or the Dock.
     Open(Vec<PathBuf>, Option<Waiter>),
+    /// A formatter finished for a tab that had text `version`.
+    Formatted { window: WindowId, tab: u64, version: u64, result: Result<String, String>, then_save: bool },
 }
 /// This is a comment. And yeah in oxide it is super fast and nice ! Let's gooooo
 /// `~/.config/oxide` (or `%APPDATA%\oxide`): where add-ons such as syntaxes live.
@@ -67,7 +72,10 @@ struct App {
     /// session, so a second copy (say, a dev build) never overwrites it.
     primary: bool,
     fonts: Option<Fonts>,
+    settings: Rc<Settings>,
     theme: Option<(Theme, Palette)>,
+    /// A problem with the settings file, shown in the next window to open.
+    settings_error: Option<String>,
     windows: HashMap<WindowId, Win>,
     last_focused: Option<WindowId>,
     clipboard: Option<arboard::Clipboard>,
@@ -84,19 +92,37 @@ impl App {
         tabs: Vec<TabInit>,
         active: usize,
     ) -> Option<WindowId> {
-        let fonts = self.fonts.get_or_insert_with(|| {
-            let fonts = Fonts::new();
+        if self.fonts.is_none() {
+            let mut fonts = Fonts::new();
             trace("fonts loaded");
-            fonts
-        });
-        let (theme, palette) = self.theme.get_or_insert_with(|| {
-            let mut themes = ThemeSet::load_defaults();
-            let theme = themes.themes.remove(THEME).expect("bundled theme");
-            let palette = Palette::from_theme(&theme);
-            (theme, palette)
-        });
-        match Win::new(event_loop, fonts, tabs, active, theme.clone(), *palette, self.proxy.clone()) {
-            Ok(win) => {
+            if let Err(e) = fonts.set_family(self.settings.font_family.as_deref()) {
+                self.settings_error.get_or_insert(e);
+            }
+            self.fonts = Some(fonts);
+        }
+        if self.theme.is_none() {
+            let (theme, palette, error) = load_theme(&self.settings);
+            self.theme = Some((theme, palette));
+            if let Some(e) = error {
+                self.settings_error.get_or_insert(e);
+            }
+        }
+        let fonts = self.fonts.as_mut().unwrap();
+        let (theme, palette) = self.theme.as_ref().unwrap();
+        let settings = self.settings.clone();
+        match Win::new(
+            event_loop,
+            fonts,
+            tabs,
+            active,
+            settings,
+            (theme.clone(), *palette),
+            self.proxy.clone(),
+        ) {
+            Ok(mut win) => {
+                if let Some(e) = self.settings_error.take() {
+                    win.notify(&e);
+                }
                 let id = win.id();
                 self.windows.insert(id, win);
                 self.last_focused = Some(id);
@@ -138,6 +164,24 @@ impl App {
         }
     }
 
+    /// Re-reads settings.toml and applies it to every window.
+    fn reload_settings(&mut self) {
+        let (settings, mut error) = settings::load();
+        let settings = Rc::new(settings);
+        let fonts = self.fonts.as_mut().expect("fonts load before the first window");
+        if let Err(e) = fonts.set_family(settings.font_family.as_deref()) {
+            error.get_or_insert(e);
+        }
+        let (theme, palette, theme_error) = load_theme(&settings);
+        error = error.or(theme_error);
+        for win in self.windows.values_mut() {
+            win.apply_settings(fonts, settings.clone(), theme.clone(), palette);
+            win.notify(error.as_deref().unwrap_or("Settings applied"));
+        }
+        self.theme = Some((theme, palette));
+        self.settings = settings;
+    }
+
     fn save_session_now(&self) {
         if self.primary {
             if let Err(e) = session::save(self.windows.values().map(Win::snapshot).collect()) {
@@ -172,6 +216,16 @@ impl App {
             self.windows.get_mut(&id).unwrap().notify("Unsaved changes. Quit again to discard them.");
         }
     }
+}
+
+/// The theme named in `settings`, falling back to the default with an error message.
+fn load_theme(settings: &Settings) -> (Theme, Palette, Option<String>) {
+    let (theme, error) = match settings::load_theme(&settings.theme) {
+        Ok(theme) => (theme, None),
+        Err(e) => (settings::load_theme(settings::DEFAULT_THEME).expect("bundled theme"), Some(e)),
+    };
+    let palette = Palette::from_theme(&theme);
+    (theme, palette, error)
 }
 
 /// Opens `path`, reporting failures on stderr.
@@ -219,6 +273,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Open(paths, waiter) => self.open_files(event_loop, paths, waiter),
+            UserEvent::Formatted { window, tab, version, result, then_save } => {
+                if let (Some(win), Some(fonts)) = (self.windows.get_mut(&window), self.fonts.as_mut()) {
+                    win.apply_format(fonts, tab, version, result, then_save);
+                }
+            }
         }
     }
 
@@ -268,6 +327,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let mut settings_saved = false;
+        for win in self.windows.values_mut() {
+            settings_saved |= win.take_settings_saved();
+        }
+        if settings_saved {
+            self.reload_settings();
+        }
         if !self.primary {
             return;
         }
@@ -344,6 +410,7 @@ fn main() {
         }
     }
 
+    let (settings, settings_error) = settings::load();
     let mut builder = EventLoop::<UserEvent>::with_user_event();
     #[cfg(target_os = "macos")]
     {
@@ -371,7 +438,9 @@ fn main() {
         paths,
         primary,
         fonts: None,
+        settings: Rc::new(settings),
         theme: None,
+        settings_error,
         windows: HashMap::new(),
         last_focused: None,
         clipboard: None,

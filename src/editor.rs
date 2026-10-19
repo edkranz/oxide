@@ -38,8 +38,9 @@ fn class(c: char) -> CharClass {
 }
 
 impl Editor {
-    pub fn new(doc: Document) -> Self {
-        let indent = detect_indent(&doc);
+    /// `default` is the indentation used when `detect` is off or the file gives no clue.
+    pub fn new(doc: Document, default: Indent, detect: bool) -> Self {
+        let indent = detect.then(|| detect_indent(&doc)).flatten().unwrap_or(default);
         Self { doc, sel: Selection::default(), indent, changes: Vec::new() }
     }
 
@@ -402,7 +403,7 @@ impl Editor {
 }
 
 /// Guesses tabs vs. spaces (and the space width) from leading whitespace.
-fn detect_indent(doc: &Document) -> Indent {
+fn detect_indent(doc: &Document) -> Option<Indent> {
     let (mut tabs, mut spaces) = (0, 0);
     let mut widths = [0usize; 9];
     for line in doc.text.lines().take(2000) {
@@ -421,14 +422,14 @@ fn detect_indent(doc: &Document) -> Indent {
         }
     }
     if tabs > spaces {
-        return Indent::Tabs;
+        return Some(Indent::Tabs);
     }
     if spaces == 0 {
-        return Indent::Spaces(4);
+        return None;
     }
     // The widest width that most indented lines are a multiple of.
-    let width = [8, 4, 3, 2].into_iter().find(|&w| widths[w] * 10 >= spaces * 9).unwrap_or(4);
-    Indent::Spaces(width)
+    let width = [8, 4, 3, 2].into_iter().find(|&w| widths[w] * 10 >= spaces * 9)?;
+    Some(Indent::Spaces(width))
 }
 
 #[cfg(test)]
@@ -442,7 +443,7 @@ mod tests {
         if text.contains("\r\n") {
             doc.line_ending = "\r\n";
         }
-        let mut editor = Editor::new(doc);
+        let mut editor = Editor::new(doc, Indent::Spaces(4), true);
         editor.sel = Selection::caret(caret);
         editor
     }
@@ -534,6 +535,13 @@ mod tests {
         assert_eq!(editor("a\n  b\n    c\n  d\n", 0).indent, Indent::Spaces(2));
         assert_eq!(editor("a\n    b\n        c\n", 0).indent, Indent::Spaces(4));
         assert_eq!(editor("plain\n", 0).indent, Indent::Spaces(4));
+        let doc = |text: &str| {
+            let mut doc = Document::empty(None);
+            doc.text = Rope::from_str(text);
+            doc
+        };
+        assert_eq!(Editor::new(doc("plain\n"), Indent::Tabs, true).indent, Indent::Tabs);
+        assert_eq!(Editor::new(doc("a\n  b\n"), Indent::Tabs, false).indent, Indent::Tabs);
     }
 
     #[test]

@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-pub const TAB_WIDTH: u16 = 4;
-
 /// Font database and glyph rasteriser, shared by every window.
 pub struct Fonts {
     system: FontSystem,
     swash: SwashCache,
+    /// The editor font in use, and the platform's default monospace font.
     mono: Option<String>,
+    default_mono: Option<String>,
 }
 
 impl Fonts {
@@ -29,11 +29,25 @@ impl Fonts {
         } else {
             &["JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono"]
         };
-        let mono = candidates
-            .iter()
-            .find(|name| system.db().faces().any(|f| f.families.iter().any(|(family, _)| family == *name)))
-            .map(|name| name.to_string());
-        Self { system, swash: SwashCache::new(), mono }
+        let mut fonts = Self { system, swash: SwashCache::new(), mono: None, default_mono: None };
+        fonts.default_mono =
+            candidates.iter().find(|name| fonts.has_family(name)).map(|name| name.to_string());
+        fonts.mono = fonts.default_mono.clone();
+        fonts
+    }
+
+    fn has_family(&self, name: &str) -> bool {
+        self.system.db().faces().any(|f| f.families.iter().any(|(family, _)| family == name))
+    }
+
+    /// Uses `name` for editor text, or the platform default for `None`.
+    pub fn set_family(&mut self, name: Option<&str>) -> Result<(), String> {
+        match name {
+            None => self.mono = self.default_mono.clone(),
+            Some(name) if self.has_family(name) => self.mono = Some(name.to_string()),
+            Some(name) => return Err(format!("font \"{name}\" is not installed")),
+        }
+        Ok(())
     }
 
     fn family(&self, ui: bool) -> Family<'_> {
@@ -56,14 +70,16 @@ pub struct Metrics {
 /// Shaped lines for one window, reused across frames until they go off screen.
 pub struct TextLayout {
     pub metrics: Metrics,
+    tab_width: u16,
     current: HashMap<u64, Rc<LayoutLine>>,
     previous: HashMap<u64, Rc<LayoutLine>>,
 }
 
 impl TextLayout {
-    pub fn new(fonts: &mut Fonts, font_size: f32) -> Self {
+    pub fn new(fonts: &mut Fonts, font_size: f32, tab_width: u16) -> Self {
         let mut layout = Self {
             metrics: Metrics { font_size, line_height: 0.0, baseline: 0.0, char_width: 0.0 },
+            tab_width,
             current: HashMap::new(),
             previous: HashMap::new(),
         };
@@ -92,7 +108,7 @@ impl TextLayout {
         ui: bool,
     ) -> Rc<LayoutLine> {
         let mut hasher = std::hash::DefaultHasher::new();
-        (text, runs, default_color, ui, self.metrics.font_size.to_bits()).hash(&mut hasher);
+        (text, runs, default_color, ui, self.metrics.font_size.to_bits(), self.tab_width).hash(&mut hasher);
         let key = hasher.finish();
         if let Some(line) = self.current.get(&key) {
             return line.clone();
@@ -122,7 +138,7 @@ impl TextLayout {
                 attrs.add_span(start..end, &span);
             }
         }
-        let shaped = ShapeLine::new(&mut fonts.system, text, &attrs, Shaping::Advanced, TAB_WIDTH);
+        let shaped = ShapeLine::new(&mut fonts.system, text, &attrs, Shaping::Advanced, self.tab_width);
         // Hinting snaps glyph advances to whole pixels (layout is already in physical pixels).
         let line = shaped
             .layout(self.metrics.font_size, None, Wrap::None, None, None, Hinting::Enabled)
