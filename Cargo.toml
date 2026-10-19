@@ -14,7 +14,7 @@ exclude = ["assets/", ".github/"]
 
 [dependencies]
 arboard = "3"
-cosmic-text = "0.17.0"
+cosmic-text = "0.19.0"
 interprocess = "2"
 regex = "1"
 rfd = "0.17.2"
