@@ -46,7 +46,7 @@ pub enum UserEvent {
     /// A formatter finished for a tab that had text `version`.
     Formatted { window: WindowId, tab: u64, version: u64, result: Result<String, String>, then_save: bool },
 }
-/// This is a comment. And yeah in oxide it is super fast and nice ! Let's gooooo
+
 /// `~/.config/oxide` (or `%APPDATA%\oxide`): where add-ons such as syntaxes live.
 pub fn config_dir() -> Option<PathBuf> {
     if cfg!(windows) {
