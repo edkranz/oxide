@@ -1243,6 +1243,11 @@ impl Win {
         self.rebuild_layout(fonts);
     }
 
+    /// Re-lays out everything after the font database changed.
+    pub fn fonts_changed(&mut self, fonts: &mut Fonts) {
+        self.rebuild_layout(fonts);
+    }
+
     fn rebuild_layout(&mut self, fonts: &mut Fonts) {
         let size = self.font_points * self.window.scale_factor() as f32;
         self.layout = TextLayout::new(fonts, size, self.settings.tab_size as u16);

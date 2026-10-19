@@ -126,6 +126,10 @@ frame to an image.
 5. **LSP as an add-on**, not core. The core will expose popups, underlines, and
    UTF-16 positions so it can be added without a rewrite.
 
+Startup: after the first launch, oxide loads only the font files it used last time
+(`fonts.json` in its data folder) and scans the rest in the background, so a cold start
+doesn't wait on the whole font library.
+
 Known limits today: one selection; caret moves by code point rather than grapheme
 cluster; lines over 16 KB aren't highlighted; no word wrap.
 

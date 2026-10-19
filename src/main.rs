@@ -38,6 +38,8 @@ pub enum UserEvent {
     Highlighted(WindowId, u64, Batch),
     /// Files from another `ox` invocation, Finder, or the Dock.
     Open(Vec<PathBuf>, Option<Waiter>),
+    /// The full font database, scanned in the background after a fast start.
+    FontsReady(cosmic_text::fontdb::Database),
     /// A formatter finished for a tab that had text `version`.
     Formatted { window: WindowId, tab: u64, version: u64, result: Result<String, String>, then_save: bool },
 }
@@ -93,8 +95,14 @@ impl App {
         active: usize,
     ) -> Option<WindowId> {
         if self.fonts.is_none() {
-            let mut fonts = Fonts::new();
-            trace("fonts loaded");
+            let mut fonts = Fonts::from_cache().unwrap_or_else(Fonts::new);
+            trace(if fonts.is_complete() { "fonts loaded (full scan)" } else { "fonts loaded (cached)" });
+            if !fonts.is_complete() {
+                let proxy = self.proxy.clone();
+                Fonts::scan(move |db| {
+                    let _ = proxy.send_event(UserEvent::FontsReady(db));
+                });
+            }
             if let Err(e) = fonts.set_family(self.settings.font_family.as_deref()) {
                 self.settings_error.get_or_insert(e);
             }
@@ -125,6 +133,8 @@ impl App {
                 }
                 let id = win.id();
                 self.windows.insert(id, win);
+                // The first frame has drawn, so the fonts it needed are known.
+                self.fonts.as_mut().unwrap().save_cache();
                 self.last_focused = Some(id);
                 Some(id)
             }
@@ -273,6 +283,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Open(paths, waiter) => self.open_files(event_loop, paths, waiter),
+            UserEvent::FontsReady(db) => {
+                let Some(fonts) = self.fonts.as_mut() else { return };
+                let result = fonts.replace_database(db);
+                for win in self.windows.values_mut() {
+                    win.fonts_changed(fonts);
+                    if let Err(e) = &result {
+                        win.notify(e);
+                    }
+                }
+            }
             UserEvent::Formatted { window, tab, version, result, then_save } => {
                 if let (Some(win), Some(fonts)) = (self.windows.get_mut(&window), self.fonts.as_mut()) {
                     win.apply_format(fonts, tab, version, result, then_save);
@@ -347,6 +367,9 @@ impl ApplicationHandler<UserEvent> for App {
         match self.session_due {
             Some(due) if Instant::now() >= due => {
                 session::save_in_background(self.windows.values().map(Win::snapshot).collect());
+                if let Some(fonts) = self.fonts.as_mut() {
+                    fonts.save_cache();
+                }
                 self.session_due = None;
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
@@ -357,6 +380,9 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.save_session_now();
+        if let Some(fonts) = self.fonts.as_mut() {
+            fonts.save_cache();
+        }
     }
 }
 

@@ -3,25 +3,99 @@
 
 use crate::highlight::StyledRun;
 use cosmic_text::{
-    Attrs, AttrsList, Color, Family, FontSystem, Hinting, LayoutLine, ShapeLine, Shaping, Style, SwashCache,
-    SwashContent, Weight, Wrap,
+    fontdb, Attrs, AttrsList, Color, Family, FontSystem, Hinting, LayoutLine, PlatformFallback, ShapeLine,
+    Shaping, Style, SwashCache, SwashContent, Weight, Wrap,
 };
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 /// Font database and glyph rasteriser, shared by every window.
+///
+/// Scanning every installed font is the slowest part of a cold start, so launches after
+/// the first load only the font files that were used last time (listed in
+/// `fonts.json`) and scan the rest on a background thread; see [`Fonts::scan`].
 pub struct Fonts {
     system: FontSystem,
     swash: SwashCache,
     /// The editor font in use, and the platform's default monospace font.
     mono: Option<String>,
     default_mono: Option<String>,
+    /// False while only the cached subset of fonts is loaded.
+    complete: bool,
+    /// Faces that have drawn text, recorded so the next launch can load just those.
+    used: HashSet<fontdb::ID>,
+    /// How many of `used` were in the last cache written, to skip redundant writes.
+    saved: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FontCache {
+    locale: String,
+    files: Vec<PathBuf>,
+}
+
+fn cache_path() -> Option<PathBuf> {
+    crate::session::data_dir().map(|d| d.join("fonts.json"))
+}
+
+/// cosmic-text's default family choices, applied to databases we build ourselves.
+fn configure(db: &mut fontdb::Database) {
+    db.set_monospace_family("Noto Sans Mono");
+    db.set_sans_serif_family("Open Sans");
+    db.set_serif_family("DejaVu Serif");
 }
 
 impl Fonts {
+    /// Loads every installed font. Slow on a cold disk cache; prefer [`Fonts::from_cache`].
     pub fn new() -> Self {
-        let system = FontSystem::new();
+        Self::with_system(FontSystem::new(), true)
+    }
+
+    /// Loads only the fonts used last time, or `None` if there is no usable cache.
+    pub fn from_cache() -> Option<Self> {
+        let cache: FontCache = serde_json::from_str(&std::fs::read_to_string(cache_path()?).ok()?).ok()?;
+        let mut db = fontdb::Database::new();
+        for file in cache.files.iter().filter(|f| f.exists()) {
+            let _ = db.load_font_file(file);
+        }
+        configure(&mut db);
+        let system = FontSystem::new_with_locale_and_db_and_fallback(cache.locale, db, PlatformFallback);
+        let fonts = Self::with_system(system, false);
+        fonts.default_mono.is_some().then_some(fonts)
+    }
+
+    /// Scans every installed font on a background thread and hands the database to
+    /// `done`, for [`Fonts::replace_database`].
+    pub fn scan(done: impl FnOnce(fontdb::Database) + Send + 'static) {
+        std::thread::spawn(move || {
+            let mut db = fontdb::Database::new();
+            db.load_system_fonts();
+            configure(&mut db);
+            done(db);
+        });
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Switches to the full font database. Returns an error if the chosen font turns
+    /// out not to be installed. Every layout must be rebuilt afterwards (face ids change).
+    pub fn replace_database(&mut self, db: fontdb::Database) -> Result<(), String> {
+        let wanted = self.mono.clone();
+        let locale = self.system.locale().to_string();
+        let system = FontSystem::new_with_locale_and_db_and_fallback(locale, db, PlatformFallback);
+        *self = Self::with_system(system, true);
+        if wanted != self.default_mono {
+            self.set_family(wanted.as_deref())?;
+        }
+        Ok(())
+    }
+
+    fn with_system(system: FontSystem, complete: bool) -> Self {
         let candidates: &[&str] = if cfg!(target_os = "macos") {
             &["Menlo", "SF Mono", "Monaco"]
         } else if cfg!(windows) {
@@ -29,22 +103,55 @@ impl Fonts {
         } else {
             &["JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono"]
         };
-        let mut fonts = Self { system, swash: SwashCache::new(), mono: None, default_mono: None };
+        let mut fonts = Self {
+            system,
+            swash: SwashCache::new(),
+            mono: None,
+            default_mono: None,
+            complete,
+            used: HashSet::new(),
+            saved: 0,
+        };
         fonts.default_mono =
             candidates.iter().find(|name| fonts.has_family(name)).map(|name| name.to_string());
         fonts.mono = fonts.default_mono.clone();
         fonts
     }
 
+    /// Records the files of every face used so far, for [`Fonts::from_cache`].
+    pub fn save_cache(&mut self) {
+        // A partial database would only record what it was started with.
+        if !self.complete || self.used.len() == self.saved {
+            return;
+        }
+        self.saved = self.used.len();
+        let mut files: Vec<PathBuf> = self
+            .used
+            .iter()
+            .filter_map(|id| match &self.system.db().face(*id)?.source {
+                fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        files.sort();
+        files.dedup();
+        let cache = FontCache { locale: self.system.locale().to_string(), files };
+        if let (Some(path), Ok(json)) = (cache_path(), serde_json::to_string(&cache)) {
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            let _ = std::fs::write(path, json);
+        }
+    }
+
     fn has_family(&self, name: &str) -> bool {
         self.system.db().faces().any(|f| f.families.iter().any(|(family, _)| family == name))
     }
 
-    /// Uses `name` for editor text, or the platform default for `None`.
+    /// Uses `name` for editor text, or the platform default for `None`. While only cached
+    /// fonts are loaded, an unknown name is accepted and checked once the scan finishes.
     pub fn set_family(&mut self, name: Option<&str>) -> Result<(), String> {
         match name {
             None => self.mono = self.default_mono.clone(),
-            Some(name) if self.has_family(name) => self.mono = Some(name.to_string()),
+            Some(name) if self.has_family(name) || !self.complete => self.mono = Some(name.to_string()),
             Some(name) => return Err(format!("font \"{name}\" is not installed")),
         }
         Ok(())
@@ -151,6 +258,7 @@ impl TextLayout {
                 line_height_opt: None,
                 glyphs: Vec::new(),
             });
+        fonts.used.extend(line.glyphs.iter().map(|g| g.font_id));
         let line = Rc::new(line);
         self.current.insert(key, line.clone());
         line
