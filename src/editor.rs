@@ -971,9 +971,8 @@ mod tests {
     fn editor(text: &str, caret: usize) -> Editor {
         let mut doc = Document::empty(None);
         doc.text = Rope::from_str(text);
-        if text.contains("\r\n") {
-            doc.line_ending = "\r\n";
-        }
+        // Set explicitly: new documents default to CRLF on Windows.
+        doc.line_ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
         let mut editor = Editor::new(doc, Indent::Spaces(4), true);
         editor.set_selection(Selection::caret(caret));
         editor
