@@ -91,7 +91,7 @@ jobs:
           spctl --assess --type execute --verbose target/release/Oxide.app
           rm dist/Oxide-macos-universal.zip
           ditto -c -k --keepParent target/release/Oxide.app dist/Oxide-macos-universal.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*
@@ -111,7 +111,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/oxide | Out-Null
           Copy-Item target/release/oxide.exe, packaging/windows/ox.cmd, README.md, LICENSE dist/oxide/
           Compress-Archive -Path dist/oxide -DestinationPath dist/Oxide-windows-x64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*.zip
@@ -140,7 +140,7 @@ jobs:
           rm -r dist/oxide
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           scripts/package-deb.sh target/release/oxide "$version" ${{ matrix.deb }} dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.arch }}
           path: dist/*
@@ -163,7 +163,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums
           path: dist/SHA256SUMS.txt
