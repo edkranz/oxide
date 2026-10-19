@@ -3,8 +3,14 @@ name = "oxide"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "A fast, lightweight text editor"
+description = "A super light text editor built in Rust"
 license = "MIT"
+repository = "https://github.com/edkranz/oxide"
+homepage = "https://github.com/edkranz/oxide"
+readme = "README.md"
+keywords = ["editor", "text-editor", "gui"]
+categories = ["text-editors"]
+exclude = ["assets/", ".github/"]
 
 [dependencies]
 arboard = "3"
