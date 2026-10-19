@@ -11,12 +11,17 @@ Not an IDE: it opens instantly, edits text well, and leaves the rest to add-ons.
 scripts/install-macos.sh
 ```
 
-Then open files from a terminal (it returns straight away), or launch Oxide from Launchpad:
+Then open files from a terminal, Finder ("Open With", or drop on the Dock icon), or Launchpad:
 
 ```sh
 ox file.rs other.md          # opens each file in a tab
-ox --wait COMMIT_EDITMSG     # blocks until the window closes: git config core.editor "ox --wait"
+ox --wait COMMIT_EDITMSG     # blocks until those tabs close: git config core.editor "ox --wait"
 ```
+
+Only one copy of Oxide runs: `ox` hands its files to it over a local socket and returns in
+a few milliseconds. Quitting keeps your tabs and any unsaved text (hot exit) and brings them
+back next time; the session is also saved a couple of seconds after each change, so a crash
+loses little.
 
 `APP_DIR` and `BIN_DIR` change where it installs (default `/Applications` and `~/.local/bin`).
 Run the script again to update.
@@ -31,7 +36,8 @@ Run the script again to update.
 | --- | --- |
 | `Cmd+S` / `Cmd+Shift+S` | Save / save as (atomic; follows symlinks; keeps line endings) |
 | `Cmd+N` / `Cmd+O` | New tab / open files (or drop files on the window) |
-| `Cmd+W`, `Cmd+Q` | Close tab / quit (press twice to discard unsaved changes) |
+| `Cmd+W` | Close tab (press twice to discard unsaved changes) |
+| `Cmd+Q` | Quit, keeping unsaved work for next time |
 | `Ctrl+Tab`, `Cmd+1`…`9` | Next tab / jump to tab (`Cmd+Shift+[`/`]` on macOS, `Ctrl+PageUp`/`PageDown` elsewhere) |
 | `Cmd+Z` / `Cmd+Shift+Z` | Undo / redo (typing is grouped into word-sized steps) |
 | `Cmd+C` / `Cmd+X` / `Cmd+V` | Copy / cut / paste (copy or cut with no selection takes the whole line) |
@@ -66,6 +72,7 @@ thread that handles typing.
   window buffer (`softbuffer`). Shaped lines are cached between frames.
 - **`find.rs`**: find and replace on top of the `regex` crate; literal queries are escaped
   so both modes share one path.
+- **`instance.rs`** and **`session.rs`**: the single running instance and hot exit.
 - **`window.rs`**: tabs, the find and go-to bar, input, scrolling, and painting a frame. Nothing redraws unless something
   changed, so an idle window uses no CPU.
 
@@ -79,8 +86,8 @@ frame to an image.
 
 1. ~~**Daily-driver basics**: find and replace, go to line, tabs, open and save-as
    dialogs, input methods (IME).~~ Done.
-2. **Instant re-open**: one running instance; `oxide file` hands the path over a socket
-   and opens a tab in milliseconds. Hot exit, so unsaved buffers survive quitting.
+2. ~~**Instant re-open**: one running instance; `ox file` hands the path over a socket
+   and opens a tab in milliseconds. Hot exit, so unsaved buffers survive quitting.~~ Done.
 3. **Feel**: multiple cursors, auto-closing brackets, comment toggling, a minimap,
    colour schemes, settings file.
 4. **Add-ons**: declarative add-ons (formatter = "pipe the buffer through `rustfmt`",

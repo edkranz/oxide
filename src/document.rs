@@ -114,6 +114,16 @@ impl Document {
         Ok(doc)
     }
 
+    /// A document restored with unsaved `text`; it stays dirty until saved.
+    pub fn with_unsaved(path: Option<PathBuf>, text: String) -> Self {
+        let mut doc = Self::empty(path);
+        doc.line_ending = detect_line_ending(&text).unwrap_or(doc.line_ending);
+        doc.text = Rope::from_str(&text);
+        // No undo step will ever have this id, so the document reads as modified.
+        doc.saved_id = u64::MAX;
+        doc
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.current_id() != self.saved_id
     }
@@ -301,11 +311,27 @@ mod tests {
         }
     }
 
-    fn scratch_dir(name: &str) -> PathBuf {
+    /// A temp folder that is deleted when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    fn scratch_dir(name: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("oxide-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        Scratch(dir)
     }
 
     #[test]
@@ -383,6 +409,18 @@ mod tests {
         assert!(doc.read_only);
         assert!(doc.save().is_err());
         assert_eq!(fs::read(&path).unwrap(), [0x66, 0xff, 0x6f]);
+    }
+
+    #[test]
+    fn restored_unsaved_text_stays_dirty_until_saved() {
+        let dir = scratch_dir("restore");
+        let path = dir.join("r.txt");
+        let mut doc = Document::with_unsaved(Some(path.clone()), "kept\r\n".into());
+        assert!(doc.is_dirty());
+        assert_eq!(doc.line_ending, "\r\n");
+        doc.save().unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(fs::read_to_string(path).unwrap(), "kept\r\n");
     }
 
     #[test]

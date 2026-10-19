@@ -9,9 +9,12 @@ license = "MIT"
 [dependencies]
 arboard = "3"
 cosmic-text = "0.17.0"
+interprocess = "2"
 regex = "1"
 rfd = "0.17.2"
 ropey = "1.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 softbuffer = "0.4"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 winit = "0.30"
@@ -24,3 +27,7 @@ strip = true
 # Regex-heavy highlighting is unusably slow unoptimised; keep dependencies fast in dev builds.
 [profile.dev.package."*"]
 opt-level = 2
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSURL", "NSString"] }

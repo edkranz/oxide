@@ -5,7 +5,9 @@ use crate::editor::{Editor, Indent};
 use crate::find::{self, FindOptions, Search, MATCH_LIMIT};
 use crate::highlight::{Batch, Highlighter, StyleCache};
 use crate::input::LineInput;
+use crate::instance::Waiter;
 use crate::render::{blend, byte_for_x, x_for_byte, Canvas, Fonts, TextLayout};
+use crate::session::{TabSnapshot, WindowSnapshot};
 use crate::UserEvent;
 use cosmic_text::LayoutLine;
 use std::error::Error;
@@ -76,6 +78,19 @@ impl Palette {
             chrome_text: blend(background, foreground, 190),
             panel: blend(background, foreground, 12),
         }
+    }
+}
+
+/// What a new tab starts with: a document and, when restored, where the view was.
+pub struct TabInit {
+    pub doc: Document,
+    pub sel: Selection,
+    pub scroll: (f32, f32),
+}
+
+impl From<Document> for TabInit {
+    fn from(doc: Document) -> Self {
+        Self { doc, sel: Selection::default(), scroll: (0.0, 0.0) }
     }
 }
 
@@ -174,13 +189,18 @@ pub struct Win {
     message: Option<(String, Instant)>,
     close_armed: Option<Instant>,
     font_points: f32,
+    /// `ox --wait` clients, each released when all of its tabs have closed.
+    waiters: Vec<(Vec<u64>, Waiter)>,
+    /// Set when something the session records has changed since it was last taken.
+    session_changed: bool,
 }
 
 impl Win {
     pub fn new(
         event_loop: &ActiveEventLoop,
         fonts: &mut Fonts,
-        docs: Vec<Document>,
+        tabs: Vec<TabInit>,
+        active: usize,
         theme: Theme,
         palette: Palette,
         proxy: EventLoopProxy<UserEvent>,
@@ -219,14 +239,16 @@ impl Win {
             message: None,
             close_armed: None,
             font_points: FONT_POINTS,
+            waiters: Vec::new(),
+            session_changed: false,
         };
-        for doc in docs {
-            win.add_tab(doc);
+        for tab in tabs {
+            win.add_tab(tab);
         }
         if win.tabs.is_empty() {
-            win.add_tab(Document::empty(None));
+            win.add_tab(Document::empty(None).into());
         }
-        win.active = 0;
+        win.active = active.min(win.tabs.len() - 1);
         win.update_title();
         // Paint before showing, so the window never flashes an empty frame.
         win.draw(fonts);
@@ -253,7 +275,7 @@ impl Win {
         &mut self.tabs[self.active].editor
     }
 
-    fn add_tab(&mut self, doc: Document) {
+    fn add_tab(&mut self, TabInit { doc, sel, scroll }: TabInit) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let (proxy, window_id) = (self.proxy.clone(), self.window.id());
@@ -264,23 +286,29 @@ impl Win {
         if doc.read_only {
             self.notify("Not valid UTF-8: opened read-only");
         }
+        let mut editor = Editor::new(doc);
+        editor.sel = sel;
         self.tabs.push(Tab {
             id,
-            styles: StyleCache::new(doc.text.len_lines()),
-            editor: Editor::new(doc),
+            styles: StyleCache::new(editor.doc.text.len_lines()),
+            editor,
             highlighter,
             syntax_name: String::new(),
-            scroll_x: 0.0,
-            scroll_y: 0.0,
+            scroll_x: scroll.0,
+            scroll_y: scroll.1,
             goal_x: None,
             close_armed: None,
             matches: None,
         });
         self.active = self.tabs.len() - 1;
+        self.session_changed = true;
+        id
     }
 
-    /// Opens each path in a tab, or switches to it if it is already open.
-    pub fn open_paths(&mut self, paths: Vec<PathBuf>) {
+    /// Opens each path in a tab, or switches to it if it is already open. Returns the
+    /// ids of those tabs.
+    pub fn open_paths(&mut self, paths: Vec<PathBuf>) -> Vec<u64> {
+        let mut ids = Vec::new();
         let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         for path in paths {
             let key = canonical(&path);
@@ -290,12 +318,13 @@ impl Win {
                 .position(|t| t.editor.doc.path.as_deref().is_some_and(|p| canonical(p) == key));
             if let Some(i) = existing {
                 self.active = i;
+                ids.push(self.tabs[i].id);
                 continue;
             }
             match Document::open(path.clone()) {
                 Ok(doc) => {
                     let replace = self.tab().is_pristine().then_some(self.active);
-                    self.add_tab(doc);
+                    ids.push(self.add_tab(doc.into()));
                     if let Some(i) = replace {
                         self.tabs.remove(i);
                         self.active = self.tabs.len() - 1;
@@ -306,6 +335,56 @@ impl Win {
         }
         self.update_title();
         self.window.request_redraw();
+        ids
+    }
+
+    pub fn tab_ids(&self) -> Vec<u64> {
+        self.tabs.iter().map(|t| t.id).collect()
+    }
+
+    /// Releases `waiter` once every tab in `ids` has closed.
+    pub fn wait_for(&mut self, ids: Vec<u64>, waiter: Waiter) {
+        if ids.is_empty() {
+            waiter.done();
+        } else {
+            self.waiters.push((ids, waiter));
+        }
+    }
+
+    /// Brings the window to the front, restoring it if minimised.
+    pub fn present(&self) {
+        self.window.set_minimized(false);
+        self.window.focus_window();
+    }
+
+    /// Whether the session needs saving; clears the flag.
+    pub fn take_session_changed(&mut self) -> bool {
+        std::mem::take(&mut self.session_changed)
+    }
+
+    /// The window's tabs for the session. Untouched empty tabs are left out.
+    pub fn snapshot(&self) -> WindowSnapshot {
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if tab.is_pristine() {
+                continue;
+            }
+            if i == self.active {
+                active = tabs.len();
+            }
+            let doc = &tab.editor.doc;
+            let unsaved = (doc.is_dirty() || doc.path.is_none()).then(|| doc.text.clone());
+            let sel = tab.editor.sel;
+            tabs.push(TabSnapshot {
+                path: doc.path.clone(),
+                unsaved,
+                anchor: sel.anchor,
+                head: sel.head,
+                scroll: (tab.scroll_x, tab.scroll_y),
+            });
+        }
+        WindowSnapshot { tabs, active }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -338,7 +417,14 @@ impl Win {
             self.notify(&format!("Unsaved changes. Close again to discard, or {PRIMARY}+S to save."));
             return Action::None;
         }
-        self.tabs.remove(i);
+        let closed = self.tabs.remove(i).id;
+        self.session_changed = true;
+        for (ids, _) in &mut self.waiters {
+            ids.retain(|id| *id != closed);
+        }
+        for (_, waiter) in self.waiters.extract_if(.., |(ids, _)| ids.is_empty()) {
+            waiter.done();
+        }
         if self.tabs.is_empty() {
             return Action::Close;
         }
@@ -471,7 +557,9 @@ impl Win {
                 self.preedit = None;
                 self.type_text(fonts, &text);
             }
-            WindowEvent::DroppedFile(path) => self.open_paths(vec![path]),
+            WindowEvent::DroppedFile(path) => {
+                self.open_paths(vec![path]);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as f32, position.y as f32);
                 if self.dragging {
@@ -592,7 +680,9 @@ impl Win {
             "v" => return Some(Action::Paste),
             "w" => return Some(self.close_tab(self.active)),
             "q" if MAC => return Some(Action::Quit),
-            "n" => self.add_tab(Document::empty(None)),
+            "n" => {
+                self.add_tab(Document::empty(None).into());
+            }
             "o" => self.open_dialog(),
             "f" => self.open_find(MAC && alt),
             "g" if MAC => self.find_next(fonts, shift),
@@ -975,6 +1065,7 @@ impl Win {
             Ok(()) => {
                 self.tab_mut().close_armed = None;
                 self.close_armed = None;
+                self.session_changed = true;
                 self.notify("Saved");
             }
             Err(e) => self.notify(&format!("Save failed: {e}")),
@@ -1129,6 +1220,7 @@ impl Win {
             tab.highlighter.edit(version, tab.editor.doc.text.clone(), changes);
             tab.close_armed = None;
             self.close_armed = None;
+            self.session_changed = true;
         }
         self.reveal(fonts);
         self.update_title();
