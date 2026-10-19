@@ -357,28 +357,39 @@ impl ApplicationHandler<UserEvent> for App {
         if settings_saved {
             self.reload_settings();
         }
-        if !self.primary {
-            return;
-        }
-        let mut changed = false;
-        for win in self.windows.values_mut() {
-            changed |= win.take_session_changed();
-        }
-        if changed {
-            self.session_due.get_or_insert_with(|| Instant::now() + SESSION_DELAY);
-        }
-        match self.session_due {
-            Some(due) if Instant::now() >= due => {
-                session::save_in_background(self.windows.values().map(Win::snapshot).collect());
-                if let Some(fonts) = self.fonts.as_mut() {
-                    fonts.save_cache();
-                }
-                self.session_due = None;
-                event_loop.set_control_flow(ControlFlow::Wait);
+
+        // Sleep until the next caret blink or session save, whichever comes first.
+        let now = Instant::now();
+        let mut wake: Option<Instant> = None;
+        let mut wake_at = |t: Instant| wake = Some(wake.map_or(t, |w| w.min(t)));
+        for win in self.windows.values() {
+            match win.next_blink() {
+                Some(t) if t <= now => win.redraw(),
+                Some(t) => wake_at(t),
+                None => {}
             }
-            Some(due) => event_loop.set_control_flow(ControlFlow::WaitUntil(due)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
+        if self.primary {
+            let mut changed = false;
+            for win in self.windows.values_mut() {
+                changed |= win.take_session_changed();
+            }
+            if changed {
+                self.session_due.get_or_insert(now + SESSION_DELAY);
+            }
+            match self.session_due {
+                Some(due) if now >= due => {
+                    session::save_in_background(self.windows.values().map(Win::snapshot).collect());
+                    if let Some(fonts) = self.fonts.as_mut() {
+                        fonts.save_cache();
+                    }
+                    self.session_due = None;
+                }
+                Some(due) => wake_at(due),
+                None => {}
+            }
+        }
+        event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {

@@ -1379,6 +1379,7 @@ dependencies = [
  "softbuffer",
  "syntect",
  "toml",
+ "unicode-segmentation",
  "winit",
  "winresource",
 ]

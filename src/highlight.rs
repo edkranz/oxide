@@ -407,10 +407,20 @@ fn main() {
             let at = next(len + 1);
             let changes = if next(3) == 0 {
                 let end = (at + next(12)).min(len);
-                doc.replace(at, end, "", Selection::caret(at), Selection::caret(at), EditKind::Other)
+                doc.edit(
+                    vec![(at, end, String::new())],
+                    &[Selection::caret(at)],
+                    &[Selection::caret(at)],
+                    EditKind::Other,
+                )
             } else {
                 let s = snippets[next(snippets.len())];
-                doc.replace(at, at, s, Selection::caret(at), Selection::caret(at), EditKind::Other)
+                doc.edit(
+                    vec![(at, at, s.to_string())],
+                    &[Selection::caret(at)],
+                    &[Selection::caret(at)],
+                    EditKind::Other,
+                )
             };
             cache.record(doc.version, &changes);
             highlighter.edit(doc.version, doc.text.clone(), changes);

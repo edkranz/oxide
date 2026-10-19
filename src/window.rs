@@ -1,7 +1,7 @@
 //! One editor window: tabs, the find and go-to bar, input handling, and painting a frame.
 
 use crate::document::{Document, Selection};
-use crate::editor::{Editor, Indent};
+use crate::editor::{self, Editor, Indent};
 use crate::find::{self, FindOptions, Search, MATCH_LIMIT};
 use crate::format;
 use crate::highlight::{Batch, Highlighter, StyleCache};
@@ -29,6 +29,9 @@ use winit::window::{Window, WindowId};
 pub const CONFIRM_WINDOW: Duration = Duration::from_secs(4);
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 const MESSAGE_TIME: Duration = Duration::from_secs(4);
+/// The caret blinks with this half-period, and holds still after this long without input.
+const BLINK: Duration = Duration::from_millis(530);
+const BLINK_IDLE: Duration = Duration::from_secs(15);
 const MAC: bool = cfg!(target_os = "macos");
 const PRIMARY: &str = if MAC { "Cmd" } else { "Ctrl" };
 
@@ -104,8 +107,8 @@ struct Tab {
     syntax_name: String,
     scroll_x: f32,
     scroll_y: f32,
-    /// Remembered x for up/down so the caret keeps its column across short lines.
-    goal_x: Option<f32>,
+    /// Remembered x per caret for up/down, so carets keep their column across short lines.
+    goals: Vec<f32>,
     close_armed: Option<Instant>,
     matches: Option<MatchCache>,
 }
@@ -197,6 +200,9 @@ pub struct Win {
     settings: Rc<Settings>,
     /// Set when the settings file was saved from this window, so the app reloads it.
     settings_saved: bool,
+    focused: bool,
+    /// When the caret last became visible; blinking is timed from here.
+    blink_start: Instant,
 }
 
 impl Win {
@@ -252,6 +258,8 @@ impl Win {
             session_changed: false,
             settings,
             settings_saved: false,
+            focused: true,
+            blink_start: Instant::now(),
         };
         for tab in tabs {
             win.add_tab(tab);
@@ -302,7 +310,7 @@ impl Win {
             false => Indent::Tabs,
         };
         let mut editor = Editor::new(doc, default_indent, self.settings.detect_indentation);
-        editor.sel = sel;
+        editor.set_selection(sel);
         self.tabs.push(Tab {
             id,
             styles: StyleCache::new(editor.doc.text.len_lines()),
@@ -311,7 +319,7 @@ impl Win {
             syntax_name: String::new(),
             scroll_x: scroll.0,
             scroll_y: scroll.1,
-            goal_x: None,
+            goals: Vec::new(),
             close_armed: None,
             matches: None,
         });
@@ -390,7 +398,7 @@ impl Win {
             }
             let doc = &tab.editor.doc;
             let unsaved = (doc.is_dirty() || doc.path.is_none()).then(|| doc.text.clone());
-            let sel = tab.editor.sel;
+            let sel = tab.editor.primary();
             tabs.push(TabSnapshot {
                 path: doc.path.clone(),
                 unsaved,
@@ -535,7 +543,7 @@ impl Win {
     fn caret_x(&mut self, fonts: &mut Fonts) -> f32 {
         let ed = &self.tab().editor;
         let line = ed.caret_line();
-        let column = ed.sel.head - ed.doc.text.line_to_char(line);
+        let column = ed.primary().head - ed.doc.text.line_to_char(line);
         let (text, laid) = self.layout_line(fonts, line);
         x_for_byte(&laid, char_to_byte(&text, column))
     }
@@ -551,12 +559,47 @@ impl Win {
         self.tab().editor.doc.text.line_to_char(line) + text[..byte].chars().count()
     }
 
+    fn caret_visible(&self) -> bool {
+        if !self.focused {
+            return false;
+        }
+        let elapsed = self.blink_start.elapsed();
+        !self.settings.caret_blink
+            || elapsed >= BLINK_IDLE
+            || (elapsed.as_millis() / BLINK.as_millis()) % 2 == 0
+    }
+
+    /// When the caret next turns on or off, if it is blinking.
+    pub fn next_blink(&self) -> Option<Instant> {
+        let elapsed = self.blink_start.elapsed();
+        if !self.focused || !self.settings.caret_blink || elapsed >= BLINK_IDLE {
+            return None;
+        }
+        let phase = (elapsed.as_millis() / BLINK.as_millis()) as u32 + 1;
+        Some(self.blink_start + BLINK * phase)
+    }
+
+    pub fn redraw(&self) {
+        self.window.request_redraw();
+    }
+
     fn region_at(&self, (x, y): (f32, f32)) -> Option<Hit> {
         self.regions.iter().rev().find(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1).map(|r| r.hit)
     }
 
     pub fn handle(&mut self, fonts: &mut Fonts, event: WindowEvent, mods: ModifiersState) -> Action {
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::Ime(_)
+        ) {
+            self.blink_start = Instant::now();
+        }
         match event {
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                self.blink_start = Instant::now();
+                self.window.request_redraw();
+            }
             WindowEvent::Resized(_) => self.window.request_redraw(),
             WindowEvent::ScaleFactorChanged { .. } => self.rebuild_layout(fonts),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
@@ -580,13 +623,13 @@ impl Win {
                 if self.dragging {
                     let pos = self.hit_text(fonts);
                     self.ed().move_to(pos, true);
-                    self.tab_mut().goal_x = None;
+                    self.tab_mut().goals.clear();
                     self.reveal(fonts);
                     self.window.request_redraw();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
-                (ElementState::Pressed, MouseButton::Left) => return self.click(fonts, mods.shift_key()),
+                (ElementState::Pressed, MouseButton::Left) => return self.click(fonts, mods),
                 (ElementState::Pressed, MouseButton::Middle) => {
                     if let Some(Hit::Tab(i) | Hit::CloseTab(i)) = self.region_at(self.mouse) {
                         return self.close_tab(i);
@@ -634,6 +677,19 @@ impl Win {
             _ => String::new(),
         };
 
+        // Add a caret above or below: Ctrl+Shift+Up/Down on macOS, Ctrl+Alt+Up/Down elsewhere.
+        let add_caret = if MAC { ctrl && shift && !mods.super_key() } else { ctrl && alt };
+        if add_caret && matches!(named, Some(NamedKey::ArrowUp | NamedKey::ArrowDown)) {
+            self.add_caret_vertically(fonts, named == Some(NamedKey::ArrowDown));
+            self.after_command(fonts);
+            return Some(Action::None);
+        }
+        // Select every occurrence: Ctrl+Cmd+G on macOS, Alt+F3 elsewhere.
+        if (MAC && ctrl && mods.super_key() && ch == "g") || (!MAC && alt && named == Some(NamedKey::F3)) {
+            self.ed().select_all_occurrences();
+            self.after_command(fonts);
+            return Some(Action::None);
+        }
         match named {
             Some(NamedKey::Tab) if ctrl => {
                 let n = self.tabs.len();
@@ -704,6 +760,16 @@ impl Win {
             }
             "o" => self.open_dialog(),
             "f" => self.open_find(MAC && alt),
+            "d" => {
+                if !self.ed().add_next_occurrence() {
+                    self.notify("No more occurrences");
+                }
+            }
+            "l" if shift => self.ed().split_into_lines(),
+            "/" => match editor::comment_style(&self.tab().syntax_name) {
+                Some(style) => self.ed().toggle_comment(style),
+                None => self.notify("No comment style for this file type"),
+            },
             "," => self.open_settings(),
             "g" if MAC => self.find_next(fonts, shift),
             "]" if MAC && shift => self.switch_tab((self.active + 1) % self.tabs.len()),
@@ -715,7 +781,7 @@ impl Win {
             // Swallow other shortcuts so they never type a letter.
             _ => return Some(Action::None),
         }
-        self.tab_mut().goal_x = None;
+        self.tab_mut().goals.clear();
         self.after_command(fonts);
         Some(Action::None)
     }
@@ -773,9 +839,10 @@ impl Win {
             NamedKey::Tab if shift => self.ed().outdent(),
             NamedKey::Tab => self.ed().indent(),
             NamedKey::Escape if self.panel.is_some() => self.close_panel(true),
+            NamedKey::Escape if self.tab().editor.sels().len() > 1 => self.ed().collapse_to_primary(),
             NamedKey::Escape => {
-                let head = self.tab().editor.sel.head;
-                self.ed().sel = Selection::caret(head)
+                let head = self.tab().editor.primary().head;
+                self.ed().set_selection(Selection::caret(head))
             }
             _ => {
                 if let Some(text) = typed_text(event, mods) {
@@ -785,7 +852,7 @@ impl Win {
             }
         }
         if !vertical {
-            self.tab_mut().goal_x = None;
+            self.tab_mut().goals.clear();
         }
         self.after_command(fonts);
         Action::None
@@ -860,7 +927,7 @@ impl Win {
             return;
         }
         self.ed().insert_text(text);
-        self.tab_mut().goal_x = None;
+        self.tab_mut().goals.clear();
         self.after_command(fonts);
     }
 
@@ -872,7 +939,7 @@ impl Win {
             return;
         }
         self.ed().paste(text);
-        self.tab_mut().goal_x = None;
+        self.tab_mut().goals.clear();
         self.after_command(fonts);
     }
 
@@ -892,7 +959,7 @@ impl Win {
         let selected = ed.selected_text();
         let initial =
             if !selected.is_empty() && !selected.contains('\n') { selected } else { self.last_query.clone() };
-        let anchor = ed.sel.start();
+        let anchor = ed.primary().start();
         match &mut self.panel {
             Some(Panel::Find { query, replace, in_replace, .. }) => {
                 *query = LineInput::new(&initial);
@@ -916,7 +983,8 @@ impl Win {
         self.close_panel(false);
         let tab = self.tab();
         let origin_scroll = (tab.scroll_x, tab.scroll_y);
-        self.panel = Some(Panel::GoTo { input: LineInput::new(""), origin: tab.editor.sel, origin_scroll });
+        self.panel =
+            Some(Panel::GoTo { input: LineInput::new(""), origin: tab.editor.primary(), origin_scroll });
         self.panel_focus = true;
         self.window.request_redraw();
     }
@@ -932,7 +1000,7 @@ impl Win {
             }
             Some(Panel::GoTo { origin, origin_scroll, .. }) if cancel => {
                 let tab = self.tab_mut();
-                tab.editor.sel = origin;
+                tab.editor.set_selection(origin);
                 (tab.scroll_x, tab.scroll_y) = origin_scroll;
             }
             _ => {}
@@ -952,7 +1020,7 @@ impl Win {
                         Some((start, end)) => Selection { anchor: start, head: end },
                         None => Selection::caret(anchor),
                     };
-                    self.ed().sel = sel;
+                    self.ed().set_selection(sel);
                     self.reveal(fonts);
                 }
             }
@@ -964,7 +1032,7 @@ impl Win {
                 let start = ed.doc.text.line_to_char(line);
                 let column = column.unwrap_or(1).max(1) - 1;
                 let pos = (start + column).min(ed.line_end(line));
-                ed.sel = Selection::caret(pos);
+                ed.set_selection(Selection::caret(pos));
                 // Centre the target line.
                 let target = line as f32 * self.line_height() - self.text_height() / 2.0;
                 self.tab_mut().scroll_y = target.max(0.0);
@@ -1007,7 +1075,7 @@ impl Win {
             Ok(m) => m,
             Err(e) => return self.notify(&e),
         };
-        let sel = self.tab().editor.sel;
+        let sel = self.tab().editor.primary();
         let found = if backwards {
             find::prev_match(&matches, sel.start())
         } else {
@@ -1015,8 +1083,8 @@ impl Win {
         };
         match found {
             Some((start, end)) => {
-                self.ed().sel = Selection { anchor: start, head: end };
-                self.tab_mut().goal_x = None;
+                self.ed().set_selection(Selection { anchor: start, head: end });
+                self.tab_mut().goals.clear();
                 self.reveal(fonts);
             }
             None => self.notify(&format!("No matches for \"{query}\"")),
@@ -1040,10 +1108,11 @@ impl Win {
             Err(e) => return self.notify(&e),
         };
         let ed = &self.tab().editor;
-        if !ed.sel.is_empty() {
+        let sel = ed.primary();
+        if !sel.is_empty() {
             let text = ed.doc.text.to_string();
-            let start = ed.doc.text.char_to_byte(ed.sel.start());
-            let end = ed.doc.text.char_to_byte(ed.sel.end());
+            let start = ed.doc.text.char_to_byte(sel.start());
+            let end = ed.doc.text.char_to_byte(sel.end());
             if let Some(replacement) = search.replacement_at(&text, start, end, &with) {
                 self.ed().replace_selection(&replacement);
                 self.after_command(fonts);
@@ -1188,12 +1257,12 @@ impl Win {
                     if let Some(edit) = format::minimal_edit(&ed.doc.text.to_string(), &formatted) {
                         // Keep the caret on the same line and column.
                         let line = ed.caret_line();
-                        let column = ed.sel.head - ed.doc.text.line_to_char(line);
+                        let column = ed.primary().head - ed.doc.text.line_to_char(line);
                         self.ed().replace_many(vec![edit]);
                         let ed = self.ed();
                         let line = line.min(ed.doc.text.len_lines() - 1);
                         let pos = (ed.doc.text.line_to_char(line) + column).min(ed.line_end(line));
-                        ed.sel = Selection::caret(pos);
+                        ed.set_selection(Selection::caret(pos));
                         self.after_command(fonts);
                     }
                     if then_save {
@@ -1257,28 +1326,68 @@ impl Win {
         self.window.request_redraw();
     }
 
-    fn move_vertical(&mut self, fonts: &mut Fonts, lines: isize, extend: bool) {
-        let x = match self.tab().goal_x {
-            Some(x) => x,
-            None => self.caret_x(fonts),
-        };
-        let ed = &self.tab().editor;
-        let target = ed.caret_line() as isize + lines;
-        let pos = if target < 0 {
-            0
-        } else if target as usize >= ed.doc.text.len_lines() {
-            ed.len()
-        } else {
-            let line = target as usize;
-            let (text, laid) = self.layout_line(fonts, line);
-            let byte = byte_for_x(&laid, &text, x);
-            self.tab().editor.doc.text.line_to_char(line) + text[..byte].chars().count()
-        };
-        self.ed().move_to(pos, extend);
-        self.tab_mut().goal_x = Some(x);
+    /// The x position of `pos` within its line.
+    fn x_of(&mut self, fonts: &mut Fonts, pos: usize) -> f32 {
+        let text = &self.tab().editor.doc.text;
+        let line = text.char_to_line(pos);
+        let column = pos - text.line_to_char(line);
+        let (text, laid) = self.layout_line(fonts, line);
+        x_for_byte(&laid, char_to_byte(&text, column))
     }
 
-    fn click(&mut self, fonts: &mut Fonts, extend: bool) -> Action {
+    /// The position on `line` closest to `x`, or the document's start or end when `line`
+    /// is out of range.
+    fn pos_at_x(&mut self, fonts: &mut Fonts, line: isize, x: f32) -> usize {
+        let ed = &self.tab().editor;
+        if line < 0 {
+            return 0;
+        }
+        if line as usize >= ed.doc.text.len_lines() {
+            return ed.len();
+        }
+        let line = line as usize;
+        let (text, laid) = self.layout_line(fonts, line);
+        let byte = byte_for_x(&laid, &text, x);
+        self.tab().editor.doc.text.line_to_char(line) + text[..byte].chars().count()
+    }
+
+    /// Moves every caret up or down by `lines`, keeping each one's column.
+    fn move_vertical(&mut self, fonts: &mut Fonts, lines: isize, extend: bool) {
+        let sels = self.tab().editor.sels().to_vec();
+        if self.tab().goals.len() != sels.len() {
+            let goals = sels.iter().map(|s| self.x_of(fonts, s.head)).collect();
+            self.tab_mut().goals = goals;
+        }
+        let goals = self.tab().goals.clone();
+        let heads: Vec<usize> = sels
+            .iter()
+            .zip(&goals)
+            .map(|(s, &x)| {
+                let line = self.tab().editor.doc.text.char_to_line(s.head) as isize + lines;
+                self.pos_at_x(fonts, line, x)
+            })
+            .collect();
+        self.ed().set_heads(&heads, extend);
+        // Carets that met were merged; their goals no longer line up.
+        if self.tab().editor.sels().len() != goals.len() {
+            self.tab_mut().goals.clear();
+        }
+    }
+
+    /// Adds a caret on the line above the first selection, or below the last.
+    fn add_caret_vertically(&mut self, fonts: &mut Fonts, below: bool) {
+        let sels = self.tab().editor.sels();
+        let edge = if below { *sels.last().unwrap() } else { sels[0] };
+        let x = self.x_of(fonts, edge.head);
+        let line = self.tab().editor.doc.text.char_to_line(edge.head) as isize + if below { 1 } else { -1 };
+        if line < 0 || line as usize >= self.tab().editor.doc.text.len_lines() {
+            return;
+        }
+        let pos = self.pos_at_x(fonts, line, x);
+        self.ed().add_selection(Selection::caret(pos));
+    }
+
+    fn click(&mut self, fonts: &mut Fonts, mods: ModifiersState) -> Action {
         match self.region_at(self.mouse) {
             Some(Hit::Tab(i)) => {
                 self.switch_tab(i);
@@ -1317,13 +1426,18 @@ impl Win {
         };
         self.last_click = Some((now, self.mouse, count));
         let pos = self.hit_text(fonts);
+        let add_caret = if MAC { mods.super_key() } else { mods.control_key() };
         match count {
-            1 => self.ed().move_to(pos, extend),
+            1 if add_caret => {
+                self.ed().add_selection(Selection::caret(pos));
+                self.last_click = None;
+            }
+            1 => self.ed().move_to(pos, mods.shift_key()),
             2 => self.ed().select_word_at(pos),
             _ => self.ed().select_line_at(pos),
         }
-        self.dragging = count == 1;
-        self.tab_mut().goal_x = None;
+        self.dragging = count == 1 && !add_caret;
+        self.tab_mut().goals.clear();
         self.after_command(fonts);
         Action::None
     }
@@ -1378,6 +1492,7 @@ impl Win {
     pub fn apply_highlights(&mut self, tab_id: u64, mut batch: Batch) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
         if let Some(name) = batch.syntax_name.take() {
+            tab.editor.pairs = if self.settings.auto_pairs { editor::pairs_for(&name) } else { &[] };
             tab.syntax_name = name;
         }
         tab.styles.apply(batch);
@@ -1408,8 +1523,10 @@ impl Win {
         let scroll_y = self.tab().scroll_y;
         let first = (scroll_y / line_height) as usize;
         let last = (((scroll_y + text_bottom - text_top) / line_height).ceil() as usize + 1).min(line_count);
-        let sel = self.tab().editor.sel;
+        let sels: Vec<Selection> = self.tab().editor.sels().to_vec();
+        let sel = self.tab().editor.primary();
         let caret_line = self.tab().editor.caret_line();
+        let caret_on = self.caret_visible();
 
         // Shape visible lines first; painting below only borrows the results.
         let mut lines = Vec::with_capacity(last.saturating_sub(first));
@@ -1445,11 +1562,16 @@ impl Win {
         for (line, text, laid) in &lines {
             let line = *line;
             let top = text_top + line as f32 * line_height - scroll_y;
-            if line == caret_line && sel.is_empty() {
-                canvas.fill(0.0, top, width, top + line_height, p.line_highlight);
-            }
             let line_start = ed.doc.text.line_to_char(line);
             let line_end = ed.line_end(line);
+            // Selections that touch this line, found by binary search (there may be many).
+            let from = sels.partition_point(|s| s.end() < line_start);
+            let here: Vec<Selection> =
+                sels[from..].iter().take_while(|s| s.start() <= line_end).copied().collect();
+            let caret_here = |s: &Selection| s.head >= line_start && s.head <= line_end;
+            if here.iter().any(|s| s.is_empty() && caret_here(s)) {
+                canvas.fill(0.0, top, width, top + line_height, p.line_highlight);
+            }
             let x_of = |pos: usize| x0 + x_for_byte(laid, char_to_byte(text, pos - line_start));
 
             if let Ok(matches) = &matches {
@@ -1467,10 +1589,10 @@ impl Win {
                     );
                 }
             }
-            if !sel.is_empty() && sel.start() <= line_end && sel.end() >= line_start {
-                let xa = x_of(sel.start().max(line_start));
-                let mut xb = x_of(sel.end().min(line_end));
-                if sel.end() > line_end {
+            for s in here.iter().filter(|s| !s.is_empty()) {
+                let xa = x_of(s.start().max(line_start));
+                let mut xb = x_of(s.end().min(line_end));
+                if s.end() > line_end {
                     xb += char_width * 0.6; // the selected line break
                 }
                 canvas.fill(xa.max(text_left), top, xb.max(text_left), top + line_height, p.selection);
@@ -1478,21 +1600,34 @@ impl Win {
 
             canvas.text(fonts, laid, x0, top + baseline, text_left, width);
 
-            let color = if line == caret_line { p.gutter_active } else { p.gutter };
+            let color = if here.iter().any(caret_here) { p.gutter_active } else { p.gutter };
             let number = self.layout.line(fonts, &(line + 1).to_string(), &[], color, false);
             let nx = gutter_width - pad - number.w;
             canvas.text(fonts, &number, nx, top + baseline, 0.0, gutter_width);
 
-            if line == caret_line {
-                let x = x_of(sel.head);
-                caret_rect = Some((x, top));
-                if let Some(preedit) = &preedit {
+            for s in here.iter().filter(|s| caret_here(s)) {
+                let x = x_of(s.head);
+                let is_primary = *s == sel;
+                if is_primary {
+                    caret_rect = Some((x, top));
+                }
+                match &preedit {
                     // Composition text floats over the line at the caret, underlined.
-                    canvas.fill(x, top, x + preedit.w, top + line_height, p.background);
-                    canvas.text(fonts, preedit, x, top + baseline, text_left, width);
-                    canvas.fill(x, top + baseline + 2.0, x + preedit.w, top + baseline + 3.0, p.foreground);
-                } else if x >= text_left - 1.0 && !self.panel_focus {
-                    canvas.fill(x, top, x + caret_width, top + line_height, p.caret);
+                    Some(preedit) if is_primary => {
+                        canvas.fill(x, top, x + preedit.w, top + line_height, p.background);
+                        canvas.text(fonts, preedit, x, top + baseline, text_left, width);
+                        canvas.fill(
+                            x,
+                            top + baseline + 2.0,
+                            x + preedit.w,
+                            top + baseline + 3.0,
+                            p.foreground,
+                        );
+                    }
+                    _ if x >= text_left - 1.0 && !self.panel_focus && caret_on => {
+                        canvas.fill(x, top, x + caret_width, top + line_height, p.caret);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1621,6 +1756,9 @@ impl Win {
         canvas.fill(0.0, top, width, height, p.chrome);
         let line_start = ed.doc.text.line_to_char(caret_line);
         let mut left = format!("Line {}, Column {}", caret_line + 1, sel.head - line_start + 1);
+        if sels.len() > 1 {
+            left.push_str(&format!("  ({} selections)", sels.len()));
+        }
         if let Some((message, at)) = &self.message {
             if at.elapsed() < MESSAGE_TIME {
                 left.push_str("    ");

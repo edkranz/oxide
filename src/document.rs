@@ -61,8 +61,8 @@ struct Transaction {
     id: u64,
     kind: EditKind,
     edits: Vec<Edit>,
-    before: Selection,
-    after: Selection,
+    before: Vec<Selection>,
+    after: Vec<Selection>,
     time: Instant,
 }
 
@@ -132,22 +132,29 @@ impl Document {
         self.undo.last().map_or(0, |t| t.id)
     }
 
-    /// Replaces `start..end` (chars) with `text` as one undoable edit.
-    pub fn replace(
+    /// Applies non-overlapping `(start, end, text)` edits (char ranges in the current text)
+    /// as one undo step, merged into the previous step when `kind` continues it (typing a
+    /// word, or a run of deletions). `before` and `after` are the selections to restore.
+    pub fn edit(
         &mut self,
-        start: usize,
-        end: usize,
-        text: &str,
-        before: Selection,
-        after: Selection,
+        mut edits: Vec<(usize, usize, String)>,
+        before: &[Selection],
+        after: &[Selection],
         kind: EditKind,
     ) -> Vec<Change> {
-        if start == end && text.is_empty() {
+        edits.retain(|(start, end, text)| start != end || !text.is_empty());
+        if edits.is_empty() {
             return Vec::new();
         }
-        let removed: String = self.text.slice(start..end).into();
-        let change = self.splice(start, end - start, text);
-        let edit = Edit { at: start, removed, inserted: text.to_string() };
+        // Back to front, so earlier ranges stay valid as later ones change length.
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+        let mut changes = Vec::new();
+        let mut recorded = Vec::new();
+        for (start, end, text) in edits {
+            let removed: String = self.text.slice(start..end).into();
+            changes.push(self.splice(start, end - start, &text));
+            recorded.push(Edit { at: start, removed, inserted: text });
+        }
         self.redo.clear();
 
         let now = Instant::now();
@@ -158,77 +165,54 @@ impl Document {
                 && last.kind == kind
                 && last.id != saved_id
                 && now.duration_since(last.time) < COALESCE_WINDOW
-                && continues(last.edits.last().unwrap(), &edit, kind);
+                && !starts_new_word(last, &recorded, kind);
             if mergeable {
-                last.edits.push(edit);
-                last.after = after;
+                last.edits.extend(recorded);
+                last.after = after.to_vec();
                 last.time = now;
-                return vec![change];
+                return changes;
             }
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.undo.push(Transaction { id, kind, edits: vec![edit], before, after, time: now });
-        vec![change]
-    }
-
-    /// Applies non-overlapping `(start, end, text)` edits (char ranges in the current
-    /// text) as a single undo step.
-    pub fn replace_many(
-        &mut self,
-        mut edits: Vec<(usize, usize, String)>,
-        before: Selection,
-        after: Selection,
-    ) -> Vec<Change> {
-        // Back to front, so earlier ranges stay valid as later ones change length.
-        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-        let mut changes = Vec::new();
-        let mut recorded = Vec::new();
-        for (start, end, text) in edits {
-            let removed: String = self.text.slice(start..end).into();
-            changes.push(self.splice(start, end - start, &text));
-            recorded.push(Edit { at: start, removed, inserted: text });
-        }
-        if recorded.is_empty() {
-            return changes;
-        }
-        self.redo.clear();
-        let id = self.next_id;
-        self.next_id += 1;
-        let tx =
-            Transaction { id, kind: EditKind::Other, edits: recorded, before, after, time: Instant::now() };
-        self.undo.push(tx);
+        let (before, after) = (before.to_vec(), after.to_vec());
+        self.undo.push(Transaction { id, kind, edits: recorded, before, after, time: now });
         changes
     }
 
-    pub fn undo(&mut self) -> Option<(Selection, Vec<Change>)> {
+    /// Ends the current undo step, so the next edit starts a new one (the caret moved).
+    pub fn seal(&mut self) {
+        if let Some(last) = self.undo.last_mut() {
+            last.kind = EditKind::Other;
+        }
+    }
+
+    pub fn undo(&mut self) -> Option<(Vec<Selection>, Vec<Change>)> {
         let tx = self.undo.pop()?;
         let mut changes = Vec::new();
         for edit in tx.edits.iter().rev() {
             let len = edit.inserted.chars().count();
             changes.push(self.splice(edit.at, len, &edit.removed));
         }
-        let selection = tx.before;
+        let selections = tx.before.clone();
         self.redo.push(tx);
         // Typing after an undo starts a fresh step.
-        if let Some(last) = self.undo.last_mut() {
-            last.kind = EditKind::Other;
-        }
-        Some((selection, changes))
+        self.seal();
+        Some((selections, changes))
     }
 
-    pub fn redo(&mut self) -> Option<(Selection, Vec<Change>)> {
+    pub fn redo(&mut self) -> Option<(Vec<Selection>, Vec<Change>)> {
         let mut tx = self.redo.pop()?;
         let mut changes = Vec::new();
         for edit in &tx.edits {
             let len = edit.removed.chars().count();
             changes.push(self.splice(edit.at, len, &edit.inserted));
         }
-        let selection = tx.after;
+        let selections = tx.after.clone();
         // A redone step must never merge with the next keystroke.
         tx.kind = EditKind::Other;
         self.undo.push(tx);
-        Some((selection, changes))
+        Some((selections, changes))
     }
 
     fn splice(&mut self, at: usize, remove: usize, insert: &str) -> Change {
@@ -276,16 +260,12 @@ impl Document {
     }
 }
 
-/// Whether `next` extends `prev` so the two belong in one undo step.
-fn continues(prev: &Edit, next: &Edit, kind: EditKind) -> bool {
-    match kind {
-        EditKind::Insert => {
-            !next.inserted.contains('\n') && next.at == prev.at + prev.inserted.chars().count()
-        }
-        // Backspace walks left; forward-delete stays put.
-        EditKind::Delete => next.at + next.removed.chars().count() == prev.at || next.at == prev.at,
-        EditKind::Other => false,
-    }
+/// Typing a space after a word starts a new undo step, so undo works word by word.
+fn starts_new_word(last: &Transaction, next: &[Edit], kind: EditKind) -> bool {
+    let typed_space = next.first().and_then(|e| e.inserted.chars().next()).is_some_and(char::is_whitespace);
+    let after_word =
+        last.edits.last().and_then(|e| e.inserted.chars().last()).is_some_and(|c| !c.is_whitespace());
+    kind == EditKind::Insert && typed_space && after_word
 }
 
 fn detect_line_ending(text: &str) -> Option<&'static str> {
@@ -300,14 +280,8 @@ mod tests {
     fn type_chars(doc: &mut Document, at: usize, text: &str) {
         for (i, c) in text.chars().enumerate() {
             let pos = at + i;
-            doc.replace(
-                pos,
-                pos,
-                &c.to_string(),
-                Selection::caret(pos),
-                Selection::caret(pos + 1),
-                EditKind::Insert,
-            );
+            let (before, after) = ([Selection::caret(pos)], [Selection::caret(pos + 1)]);
+            doc.edit(vec![(pos, pos, c.to_string())], &before, &after, EditKind::Insert);
         }
     }
 
@@ -339,18 +313,31 @@ mod tests {
         let mut doc = Document::empty(None);
         type_chars(&mut doc, 0, "hello");
         assert_eq!(doc.text.to_string(), "hello");
-        let (sel, _) = doc.undo().unwrap();
+        let (sels, _) = doc.undo().unwrap();
         assert_eq!(doc.text.to_string(), "");
-        assert_eq!(sel, Selection::caret(0));
+        assert_eq!(sels, vec![Selection::caret(0)]);
         doc.redo().unwrap();
         assert_eq!(doc.text.to_string(), "hello");
+    }
+
+    #[test]
+    fn undo_goes_word_by_word_and_stops_where_the_caret_moved() {
+        let mut doc = Document::empty(None);
+        type_chars(&mut doc, 0, "one two");
+        doc.undo();
+        assert_eq!(doc.text.to_string(), "one");
+        doc.redo();
+        doc.seal();
+        type_chars(&mut doc, 7, "!");
+        doc.undo();
+        assert_eq!(doc.text.to_string(), "one two");
     }
 
     #[test]
     fn typing_a_newline_starts_a_new_step() {
         let mut doc = Document::empty(None);
         type_chars(&mut doc, 0, "ab");
-        doc.replace(2, 2, "\n", Selection::caret(2), Selection::caret(3), EditKind::Other);
+        doc.edit(vec![(2, 2, "\n".into())], &[Selection::caret(2)], &[Selection::caret(3)], EditKind::Other);
         type_chars(&mut doc, 3, "cd");
         doc.undo();
         assert_eq!(doc.text.to_string(), "ab\n");
@@ -394,7 +381,7 @@ mod tests {
 
         let mut doc = Document::open(path.clone()).unwrap();
         assert_eq!(doc.line_ending, "\r\n");
-        doc.replace(0, 3, "ONE", Selection::caret(0), Selection::caret(3), EditKind::Other);
+        doc.edit(vec![(0, 3, "ONE".into())], &[Selection::caret(0)], &[Selection::caret(3)], EditKind::Other);
         doc.save().unwrap();
         assert_eq!(fs::read_to_string(&real).unwrap(), "ONE\r\ntwo\r\n");
         assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink() || cfg!(not(unix)));
@@ -428,7 +415,7 @@ mod tests {
         let mut doc = Document::empty(None);
         doc.text = Rope::from_str("a-b-c");
         let edits = vec![(1, 2, "+".into()), (3, 4, "++".into())];
-        doc.replace_many(edits, Selection::caret(0), Selection::caret(0));
+        doc.edit(edits, &[Selection::caret(0)], &[Selection::caret(0)], EditKind::Other);
         assert_eq!(doc.text.to_string(), "a+b++c");
         doc.undo();
         assert_eq!(doc.text.to_string(), "a-b-c");
@@ -441,10 +428,19 @@ mod tests {
         let mut doc = Document::empty(None);
         doc.text = Rope::from_str("a\nb\nc\n");
         // Join lines 1 and 2 ("b\nc" -> "bc").
-        let change = doc.replace(3, 4, "", Selection::caret(3), Selection::caret(3), EditKind::Other)[0];
+        let change = doc.edit(
+            vec![(3, 4, "".into())],
+            &[Selection::caret(3)],
+            &[Selection::caret(3)],
+            EditKind::Other,
+        )[0];
         assert_eq!((change.first_line, change.old_lines, change.new_lines), (1, 2, 1));
-        let change =
-            doc.replace(0, 0, "x\ny\n", Selection::caret(0), Selection::caret(4), EditKind::Other)[0];
+        let change = doc.edit(
+            vec![(0, 0, "x\ny\n".into())],
+            &[Selection::caret(0)],
+            &[Selection::caret(4)],
+            EditKind::Other,
+        )[0];
         assert_eq!((change.first_line, change.old_lines, change.new_lines), (0, 1, 3));
     }
 }

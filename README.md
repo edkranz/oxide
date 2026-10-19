@@ -54,6 +54,12 @@ and every push is built and tested on macOS, Windows, and Linux.
 | `Cmd+G` / `Cmd+Shift+G` (`F3` / `Shift+F3`) | Find next / previous with the find bar closed |
 | `Ctrl+G` | Go to line (`line` or `line:column`, previews as you type) |
 | `Cmd+A` | Select all |
+| `Cmd+D` | Select the word, then add its next occurrence as another cursor |
+| `Ctrl+Cmd+G` (`Alt+F3` elsewhere) | Select every occurrence |
+| `Cmd+Shift+L` | Split a selection into one cursor per line |
+| `Ctrl+Shift+↑/↓` (`Ctrl+Alt+↑/↓` elsewhere), `Cmd+click` (`Ctrl+click`) | Add a cursor |
+| `Escape` | Back to one cursor |
+| `Cmd+/` | Toggle comment |
 | `Tab` / `Shift+Tab` | Indent / outdent (whole lines when the selection spans several) |
 | `Alt+←/→` (`Ctrl` elsewhere) | Move by word; add `Shift` to select |
 | `Cmd+←/→`, `Home`/`End` | Line start (smart: indentation first) / end |
@@ -62,6 +68,9 @@ and every push is built and tested on macOS, Windows, and Linux.
 | `Cmd+,` | Open settings |
 
 Double-click selects a word, triple-click a line. Middle-click a tab to close it.
+Every editing command works on all cursors at once, as one undo step. Brackets and quotes
+complete as you type (and step over / delete as a pair); Enter between brackets opens an
+indented line. The caret moves over emoji and accented letters as single characters.
 Input methods (Chinese, Japanese, Korean, accented characters) are supported.
 
 ## How it works
@@ -126,8 +135,8 @@ frame to an image.
    dialogs, input methods (IME).~~ Done.
 2. ~~**Instant re-open**: one running instance; `ox file` hands the path over a socket
    and opens a tab in milliseconds. Hot exit, so unsaved buffers survive quitting.~~ Done.
-3. **Feel**: multiple cursors, auto-closing brackets, comment toggling, a minimap,
-   colour schemes, settings file.
+3. **Feel**: ~~multiple cursors, auto-closing brackets, comment toggling, settings
+   file~~ (done); word wrap; a minimap.
 4. **Add-ons**: ~~declarative formatters, themes, and syntaxes~~ (done); keymaps; then
    sandboxed WASM add-ons for anything needing code. A public registry later.
 5. **LSP as an add-on**, not core. The core will expose popups, underlines, and
@@ -137,8 +146,7 @@ Startup: after the first launch, oxide loads only the font files it used last ti
 (`fonts.json` in its data folder) and scans the rest in the background, so a cold start
 doesn't wait on the whole font library.
 
-Known limits today: one selection; caret moves by code point rather than grapheme
-cluster; lines over 16 KB aren't highlighted; no word wrap.
+Known limits today: lines over 16 KB aren't highlighted; no word wrap.
 
 ## License
 

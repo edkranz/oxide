@@ -20,6 +20,9 @@ pub struct Settings {
     pub detect_indentation: bool,
     /// Run the file's formatter before every save.
     pub format_on_save: bool,
+    /// Complete brackets and quotes while typing.
+    pub auto_pairs: bool,
+    pub caret_blink: bool,
     #[serde(rename = "formatter")]
     pub formatters: Vec<Formatter>,
 }
@@ -43,6 +46,8 @@ impl Default for Settings {
             translate_tabs_to_spaces: true,
             detect_indentation: true,
             format_on_save: false,
+            auto_pairs: true,
+            caret_blink: true,
             formatters: Vec::new(),
         }
     }
@@ -119,6 +124,9 @@ theme = "base16-ocean.dark"
 tab_size = 4
 translate_tabs_to_spaces = true
 detect_indentation = true
+
+auto_pairs = true    # complete brackets and quotes as you type
+caret_blink = true
 
 # Format with Shift+Alt+F, or on every save:
 format_on_save = false
