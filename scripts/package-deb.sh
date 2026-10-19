@@ -8,6 +8,7 @@ binary=$1 version=$2 arch=$3 out=$4
 root=$(cd "$(dirname "$0")/.." && pwd)
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
+chmod 755 "$stage"  # mktemp makes it private; this becomes the package's root
 
 install -Dm755 "$binary" "$stage/usr/bin/oxide"
 ln -s oxide "$stage/usr/bin/ox"
